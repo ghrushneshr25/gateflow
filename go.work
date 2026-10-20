@@ -4,6 +4,7 @@ use (
 	./libs/go
 	./services/admission
 	./services/inventory
+	./services/order
 	./services/payment-simulator
 	./services/sale
 )
