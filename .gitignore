@@ -1,0 +1,42 @@
+# Secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Go
+bin/
+dist/
+coverage.out
+*.test
+*.prof
+/vendor/
+
+# React / Node
+node_modules/
+.next/
+.vite/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local infrastructure data
+data/
+postgres-data/
+redis-data/
+kafka-data/
+
+docs/
+
+# Test artifacts
+test-results/
+playwright-report/
