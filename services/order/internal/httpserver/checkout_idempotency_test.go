@@ -34,6 +34,9 @@ func (m *mockStore) Get(context.Context, string) (store.Order, error) {
 	return store.Order{}, store.ErrNotFound
 }
 func (m *mockStore) ListByBuyer(context.Context, string) ([]store.Order, error) { return nil, nil }
+func (m *mockStore) ListByStatus(context.Context, string, int) ([]store.Order, error) {
+	return nil, nil
+}
 func (m *mockStore) CreateWithHold(context.Context, store.Order, string, time.Time) (store.Order, error) {
 	return store.Order{}, store.ErrLimit
 }
@@ -46,6 +49,8 @@ func (m *mockStore) HeldAndCommittedQty(context.Context, string, string) (int, e
 	return 0, nil
 }
 func (m *mockStore) MarkEventProcessed(context.Context, string) (bool, error) { return true, nil }
+func (m *mockStore) CountOutboxForAggregate(context.Context, string) (int, error) { return 0, nil }
+func (m *mockStore) CountOutboxByEventID(context.Context, string) (int, error)  { return 0, nil }
 
 type mockHTTP struct{}
 

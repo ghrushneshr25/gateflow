@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
 )
 
 const HeaderCorrelationID = "X-Correlation-ID"
@@ -27,7 +27,7 @@ func CorrelationID(r *http.Request) string {
 	if id := r.Header.Get(HeaderCorrelationID); id != "" {
 		return id
 	}
-	return uuid.NewString()
+	return ids.ULID()
 }
 
 func WriteJSON(w http.ResponseWriter, status int, v any) {

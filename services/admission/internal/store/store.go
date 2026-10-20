@@ -10,11 +10,19 @@ import (
 )
 
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrBoundOther     = errors.New("bound other")
-	ErrExpired         = errors.New("expired")
-	ErrInvalidState    = errors.New("invalid state")
-	ErrBudgetExhausted = errors.New("budget exhausted")
+	ErrNotFound             = errors.New("not found")
+	ErrBoundOther          = errors.New("bound other")
+	ErrExpired              = errors.New("expired")
+	ErrInvalidState         = errors.New("invalid state")
+	ErrBudgetExhausted      = errors.New("budget exhausted")
+	ErrCoordinationFenced   = errors.New("coordination fenced")
+	ErrCoordinationUnavailable = errors.New("coordination state unavailable")
+)
+
+const (
+	CoordModeActive = "ACTIVE"
+	CoordModeFenced = "FENCED"
+	CoordID         = "admission"
 )
 
 type Store struct{ pool *pgxpool.Pool }
@@ -200,12 +208,20 @@ func releaseActiveCheckout(ctx context.Context, tx pgx.Tx, sessionID string) err
 }
 
 // GrantFIFO issues entitlement for JOINED entry under durable grant budgets.
+// Coordination row is locked FOR UPDATE for the whole transaction so a concurrent
+// fence cannot report success while this grant can still commit under ACTIVE.
 func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (QueueEntry, Entitlement, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return QueueEntry{}, Entitlement{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	// Linearization lock with operator fence (first durable lock in grant path).
+	coord, err := lockCoordination(ctx, tx)
+	if err != nil {
+		return QueueEntry{}, Entitlement{}, err
+	}
 
 	var e QueueEntry
 	err = tx.QueryRow(ctx, `
@@ -219,6 +235,7 @@ func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID
 		return e, Entitlement{}, err
 	}
 
+	// Existing entitlement: not a new grant — allowed while FENCED.
 	if e.EntitlementID != nil && *e.EntitlementID != "" {
 		ent, err := s.getEntitlementTx(ctx, tx, *e.EntitlementID)
 		if err != nil {
@@ -228,6 +245,11 @@ func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID
 			return e, ent, err
 		}
 		return e, ent, nil
+	}
+
+	// New grant issuance requires ACTIVE under the held coordination lock.
+	if coord.Mode != CoordModeActive {
+		return e, Entitlement{}, ErrCoordinationFenced
 	}
 
 	if err := consumeGrantTokens(ctx, tx, sessionID); err != nil {
@@ -388,6 +410,129 @@ func (s *Store) MarkEventProcessed(ctx context.Context, eventID string) (bool, e
 		return false, err
 	}
 	return ct.RowsAffected() == 1, nil
+}
+
+// Coordination is the durable fence/active state for admission grants.
+type Coordination struct {
+	ID          string     `json:"id"`
+	Epoch       int64      `json:"epoch"`
+	Mode        string     `json:"mode"`
+	FenceReason *string    `json:"fence_reason,omitempty"`
+	FencedAt    *time.Time `json:"fenced_at,omitempty"`
+	FencedBy    *string    `json:"fenced_by,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+func lockCoordination(ctx context.Context, tx pgx.Tx) (Coordination, error) {
+	var c Coordination
+	err := tx.QueryRow(ctx, `
+		SELECT id, epoch, mode, fence_reason, fenced_at, fenced_by, updated_at
+		FROM coordination_state WHERE id=$1 FOR UPDATE`, CoordID).
+		Scan(&c.ID, &c.Epoch, &c.Mode, &c.FenceReason, &c.FencedAt, &c.FencedBy, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return c, ErrCoordinationUnavailable
+	}
+	if err != nil {
+		return c, err
+	}
+	if c.Mode != CoordModeActive && c.Mode != CoordModeFenced {
+		return c, ErrCoordinationUnavailable
+	}
+	return c, nil
+}
+
+func (s *Store) GetCoordination(ctx context.Context) (Coordination, error) {
+	var c Coordination
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, epoch, mode, fence_reason, fenced_at, fenced_by, updated_at
+		FROM coordination_state WHERE id=$1`, CoordID).
+		Scan(&c.ID, &c.Epoch, &c.Mode, &c.FenceReason, &c.FencedAt, &c.FencedBy, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return c, ErrCoordinationUnavailable
+	}
+	return c, err
+}
+
+// FenceAdmission sets mode=FENCED. Linearization: holds FOR UPDATE until commit.
+// After this returns successfully, no GrantFIFO may commit a *new* entitlement under ACTIVE.
+func (s *Store) FenceAdmission(ctx context.Context, reason, actor string, now time.Time) (Coordination, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Coordination{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	c, err := lockCoordination(ctx, tx)
+	if err != nil {
+		return c, err
+	}
+	if c.Mode == CoordModeFenced {
+		// Idempotent fence: keep state, still "success".
+		if err := tx.Commit(ctx); err != nil {
+			return c, err
+		}
+		return c, nil
+	}
+	if reason == "" {
+		reason = "operator_fence"
+	}
+	err = tx.QueryRow(ctx, `
+		UPDATE coordination_state
+		SET mode='FENCED',
+		    epoch = epoch + 1,
+		    fence_reason=$2,
+		    fenced_at=$3,
+		    fenced_by=$4,
+		    updated_at=$3
+		WHERE id=$1
+		RETURNING id, epoch, mode, fence_reason, fenced_at, fenced_by, updated_at`,
+		CoordID, reason, now, actor,
+	).Scan(&c.ID, &c.Epoch, &c.Mode, &c.FenceReason, &c.FencedAt, &c.FencedBy, &c.UpdatedAt)
+	if err != nil {
+		return c, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+// UnfenceAdmission sets mode=ACTIVE. Explicit operator action only.
+func (s *Store) UnfenceAdmission(ctx context.Context, actor string, now time.Time) (Coordination, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Coordination{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	c, err := lockCoordination(ctx, tx)
+	if err != nil {
+		return c, err
+	}
+	if c.Mode == CoordModeActive {
+		if err := tx.Commit(ctx); err != nil {
+			return c, err
+		}
+		return c, nil
+	}
+	err = tx.QueryRow(ctx, `
+		UPDATE coordination_state
+		SET mode='ACTIVE',
+		    fence_reason=NULL,
+		    fenced_at=NULL,
+		    fenced_by=$2,
+		    updated_at=$3
+		WHERE id=$1
+		RETURNING id, epoch, mode, fence_reason, fenced_at, fenced_by, updated_at`,
+		CoordID, actor, now,
+	).Scan(&c.ID, &c.Epoch, &c.Mode, &c.FenceReason, &c.FencedAt, &c.FencedBy, &c.UpdatedAt)
+	if err != nil {
+		return c, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return c, err
+	}
+	return c, nil
 }
 
 // SetBudgetCaps updates max caps without resetting counters (safe multi-instance config).

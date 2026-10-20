@@ -20,3 +20,12 @@ State changes requiring events must not lose or double-apply business effects.
 + Durable publication linked to commits
 - Publisher lag must be monitored
 
+## Implementation notes (P4.3)
+
+- Claim: `FOR UPDATE SKIP LOCKED` with `locked_by` / `locked_until` lease; no DB txn held during Kafka I/O.
+- Mark `published_at` only after Kafka `RequireOne` ack.
+- Crash after ack before mark → republish same `event_id`; consumer `processed_events` + `order_confirmed_effects` in one txn.
+- Kafka downtime does not block `Store.Confirm`.
+- Poison path: `quarantine` after repeated publish failures (attempt_count ≥ 25).
+- Topic: `gateflow.order.order.confirmed`; client: `segmentio/kafka-go`.
+

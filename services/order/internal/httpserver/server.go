@@ -1,20 +1,21 @@
 package httpserver
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
+	"github.com/ghrushneshrathod/gateflow/services/order/internal/orchestrate"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/store"
 )
 
@@ -31,6 +32,7 @@ type OrderStore interface {
 	GetByIdempotency(ctx context.Context, buyerID, key string) (store.Order, error)
 	Get(ctx context.Context, id string) (store.Order, error)
 	ListByBuyer(ctx context.Context, buyerID string) ([]store.Order, error)
+	ListByStatus(ctx context.Context, status string, limit int) ([]store.Order, error)
 	CreateWithHold(ctx context.Context, o store.Order, holdID string, now time.Time) (store.Order, error)
 	Update(ctx context.Context, o store.Order) error
 	Confirm(ctx context.Context, orderID, eventID, corr string, payload any, now time.Time) (store.Order, error)
@@ -49,9 +51,12 @@ type Server struct {
 	InventoryBase string
 	PaymentBase   string
 	HTTP          HTTPDoer
+	// Driver is optional; if nil, built from HTTP deps.
+	Driver *orchestrate.Driver
+	// PaymentScenario overrides default success (tests / env).
+	PaymentScenario string
 }
 
-// New is a convenience constructor for production defaults.
 func New(st *store.Store) *Server {
 	return NewWithDeps(st, &http.Client{Timeout: 5 * time.Second}, Deps{
 		SaleBase:      env("SALE_BASE_URL", "http://127.0.0.1:8081"),
@@ -61,19 +66,53 @@ func New(st *store.Store) *Server {
 	})
 }
 
-// NewWithDeps constructs the API server with injected ports (nexus / tests).
 func NewWithDeps(st OrderStore, httpDoer HTTPDoer, deps Deps) *Server {
 	if httpDoer == nil {
 		httpDoer = &http.Client{Timeout: 5 * time.Second}
 	}
-	return &Server{
-		Store:         st,
-		SaleBase:      deps.SaleBase,
-		AdmissionBase: deps.AdmissionBase,
-		InventoryBase: deps.InventoryBase,
-		PaymentBase:   deps.PaymentBase,
-		HTTP:          httpDoer,
+	s := &Server{
+		Store:           st,
+		SaleBase:        deps.SaleBase,
+		AdmissionBase:   deps.AdmissionBase,
+		InventoryBase:   deps.InventoryBase,
+		PaymentBase:     deps.PaymentBase,
+		HTTP:            httpDoer,
+		PaymentScenario: env("PAYMENT_SCENARIO", "success"),
 	}
+	lease := 300
+	if v := os.Getenv("ORDER_LEASE_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			lease = n
+		}
+	}
+	s.Driver = &orchestrate.Driver{
+		Store: st,
+		Downstream: &orchestrate.HTTPDownstream{
+			HTTP: httpDoer, AdmissionBase: deps.AdmissionBase,
+			InventoryBase: deps.InventoryBase, PaymentBase: deps.PaymentBase,
+			ServiceToken: serviceTokenFromEnv(),
+		},
+		PaymentScenario: s.PaymentScenario,
+		LeaseSeconds:    lease,
+	}
+	return s
+}
+
+// serviceTokenFromEnv returns GATEFLOW_SERVICE_TOKEN or a minted service JWT for S2S recover calls.
+func serviceTokenFromEnv() string {
+	if t := os.Getenv("GATEFLOW_SERVICE_TOKEN"); t != "" {
+		return t
+	}
+	signer := authn.NewDevSigner(os.Getenv("GATEFLOW_DEV_JWT_SECRET"))
+	tok, err := signer.Sign(authn.Claims{
+		Subject:       "order-service",
+		PrincipalType: "service",
+		Scopes:        []string{"ops:payment:recover", "ops:order:recover", "*"},
+	}, 24*time.Hour)
+	if err != nil {
+		return ""
+	}
+	return tok
 }
 
 func env(k, d string) string {
@@ -87,6 +126,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/checkouts", s.checkout)
 	mux.HandleFunc("GET /v1/orders/{id}", s.getOrder)
 	mux.HandleFunc("GET /v1/orders", s.listOrders)
+	mux.HandleFunc("POST /v1/orders/{id}/reconcile", s.reconcile)
+	mux.HandleFunc("GET /v1/admin/reconciliation", s.listReconciliation)
 }
 
 func buyer(r *http.Request) string {
@@ -125,7 +166,109 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	b := buyer(r)
+	if b != "" && o.BuyerID != b {
+		httpx.WriteError(w, 403, "ORD_FORBIDDEN", "not owner", corr, "failed", false)
+		return
+	}
 	httpx.WriteJSON(w, 200, o)
+}
+
+func (s *Server) requireOpsOrService(w http.ResponseWriter, r *http.Request, corr, scope string) bool {
+	c, ok := authn.ClaimsFromContext(r.Context())
+	if !ok || !authn.IsOperatorOrService(c, scope) {
+		// Accept operator/service with recover scopes
+		if ok && (c.PrincipalType == "operator" || c.PrincipalType == "service") {
+			if authn.HasScope(c, scope) || authn.HasScope(c, "ops:order:recover") || authn.HasScope(c, "*") {
+				return true
+			}
+		}
+		httpx.WriteError(w, 401, "ORD_UNAUTHORIZED", "valid operator/service bearer token required", corr, "failed", false)
+		return false
+	}
+	return true
+}
+
+func (s *Server) listReconciliation(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	if !s.requireOpsOrService(w, r, corr, "ops:order:recover") {
+		return
+	}
+	items, err := s.Store.ListByStatus(r.Context(), orchestrate.StatusReconciliationRequired, 100)
+	if err != nil {
+		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	if items == nil {
+		items = []store.Order{}
+	}
+	pending, _ := s.Store.ListByStatus(r.Context(), orchestrate.StatusPaymentPending, 100)
+	httpx.WriteJSON(w, 200, map[string]any{
+		"reconciliation_required": items,
+		"payment_pending":         pending,
+	})
+}
+
+func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	id := r.PathValue("id")
+	o, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		httpx.WriteError(w, 404, "ORD_NOT_FOUND", "not found", corr, "failed", false)
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	// Authorization: owner buyer OR verified ops/service JWT.
+	c, ok := authn.ClaimsFromContext(r.Context())
+	opsOK := ok && authn.IsOperatorOrService(c, "ops:order:recover")
+	if !opsOK && ok && (c.PrincipalType == "operator" || c.PrincipalType == "service") &&
+		(authn.HasScope(c, "ops:order:recover") || authn.HasScope(c, "*")) {
+		opsOK = true
+	}
+	b := buyer(r)
+	if !opsOK {
+		if b == "" || o.BuyerID != b {
+			httpx.WriteError(w, 403, "ORD_FORBIDDEN", "not owner; operator/service JWT required for cross-buyer reconcile", corr, "failed", false)
+			return
+		}
+	}
+	ctx := r.Context()
+	if tok := bearerToken(r); tok != "" {
+		ctx = orchestrate.WithServiceToken(ctx, tok)
+	}
+	out, err := s.Driver.Advance(ctx, o.ID, corr)
+	if err != nil && out.ID == "" {
+		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	httpx.WriteJSON(w, 200, map[string]any{
+		"order":  out,
+		"result": reconcileResult(out.Status),
+	})
+}
+
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && (h[:7] == "Bearer " || h[:7] == "bearer ") {
+		return h[7:]
+	}
+	return ""
+}
+
+func reconcileResult(status string) string {
+	switch status {
+	case orchestrate.StatusConfirmed:
+		return "resolved_confirmed"
+	case orchestrate.StatusFailed:
+		return "resolved_failed"
+	case orchestrate.StatusPaymentPending, orchestrate.StatusReconciliationRequired:
+		return "still_ambiguous"
+	default:
+		return "in_progress"
+	}
 }
 
 func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +284,7 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 		AmountCents    int64  `json:"amount_cents"`
 		Currency       string `json:"currency"`
 		IdempotencyKey string `json:"idempotency_key"`
+		PaymentScenario string `json:"payment_scenario"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpx.WriteError(w, 400, "ORD_VALIDATION_FAILED", "invalid body", corr, "failed", false)
@@ -176,17 +320,24 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, 409, "ORD_IDEMPOTENCY_CONFLICT", "conflicting idempotency key reuse", corr, "conflict", false)
 			return
 		}
-		// Lost-response safe: return established order for any status (including in-progress).
-		// Do not start a second logical checkout.
-		httpx.WriteJSON(w, 200, existing)
+		// Resume non-terminal orders; return terminals as-is.
+		if existing.Status == orchestrate.StatusConfirmed || existing.Status == orchestrate.StatusFailed {
+			httpx.WriteJSON(w, 200, existing)
+			return
+		}
+		if req.PaymentScenario != "" {
+			s.Driver.PaymentScenario = req.PaymentScenario
+		}
+		out, _ := s.Driver.Advance(r.Context(), existing.ID, corr)
+		httpx.WriteJSON(w, 200, out)
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
 
-	// Policy snapshot
-	policy, err := s.getJSON(r, s.SaleBase+"/v1/sessions/"+req.SessionID+"/purchase-policy", corr)
+	// Policy snapshot (best-effort; default on failure is not used — require sale)
+	policy, err := s.fetchPolicy(r.Context(), req.SessionID, corr)
 	if err != nil {
 		httpx.WriteError(w, 502, "ORD_SALE_UNAVAILABLE", err.Error(), corr, "failed", true)
 		return
@@ -195,12 +346,11 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 	policyVersion := intFrom(policy["version"], 1)
 
 	now := time.Now().UTC()
-	checkoutOp := ids.New("chk")
 	intendedID := ids.New("ord")
 	o := store.Order{
 		ID: intendedID, BuyerID: b, SessionID: req.SessionID, TicketTypeID: req.TicketTypeID,
-		PoolID: req.PoolID, Quantity: req.Quantity, Status: "CREATED", EntitlementID: req.EntitlementID,
-		CheckoutOperationID: checkoutOp, InventoryOperationID: ids.New("invop"), PaymentOperationID: ids.New("payop"),
+		PoolID: req.PoolID, Quantity: req.Quantity, Status: orchestrate.StatusCreated, EntitlementID: req.EntitlementID,
+		CheckoutOperationID: ids.New("chk"), InventoryOperationID: ids.New("invop"), PaymentOperationID: ids.New("payop"),
 		AmountCents: req.AmountCents, Currency: req.Currency, PolicyVersion: policyVersion, MaxPerBuyer: maxPerBuyer,
 		IdempotencyKey: key, RequestHash: reqHash,
 	}
@@ -217,102 +367,38 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
-	// Concurrent first-create lost the insert race: return established order; do not dual-orchestrate.
 	if o.ID != intendedID {
-		httpx.WriteJSON(w, 200, o)
-		return
-	}
-	if o.Status != "CREATED" {
-		httpx.WriteJSON(w, 200, o)
-		return
-	}
-
-	// Bind entitlement
-	bindBody, _ := json.Marshal(map[string]string{
-		"buyer_id": b, "checkout_operation_id": o.CheckoutOperationID,
-	})
-	if _, err := s.postJSON(r, s.AdmissionBase+"/v1/entitlements/"+req.EntitlementID+"/bind", bindBody, corr); err != nil {
-		_ = s.Store.Fail(r.Context(), o.ID, time.Now().UTC())
-		httpx.WriteError(w, 409, "ORD_ENTITLEMENT_INVALID", err.Error(), corr, "failed", false)
-		return
-	}
-	o.Status = "ENTITLEMENT_BOUND"
-	o.UpdatedAt = time.Now().UTC()
-	_ = s.Store.Update(r.Context(), o)
-
-	// Reserve inventory
-	resBody, _ := json.Marshal(map[string]any{
-		"operation_id": o.InventoryOperationID, "pool_id": o.PoolID, "quantity": o.Quantity,
-		"buyer_id": o.BuyerID, "order_id": o.ID, "lease_seconds": 300,
-	})
-	res, err := s.postJSON(r, s.InventoryBase+"/v1/reservations", resBody, corr)
-	if err != nil {
-		_ = s.Store.Fail(r.Context(), o.ID, time.Now().UTC())
-		httpx.WriteError(w, 409, "ORD_RESERVATION_FAILED", err.Error(), corr, "failed", false)
-		return
-	}
-	resID, _ := res["id"].(string)
-	o.ReservationID = &resID
-	o.Status = "RESERVATION_HELD"
-	o.UpdatedAt = time.Now().UTC()
-	_ = s.Store.Update(r.Context(), o)
-
-	// Consume entitlement
-	consBody, _ := json.Marshal(map[string]string{"checkout_operation_id": o.CheckoutOperationID})
-	_, _ = s.postJSON(r, s.AdmissionBase+"/v1/entitlements/"+req.EntitlementID+"/consume", consBody, corr)
-
-	// Payment
-	payBody, _ := json.Marshal(map[string]any{
-		"operation_id": o.PaymentOperationID, "order_id": o.ID,
-		"amount_cents": o.AmountCents, "currency": o.Currency, "scenario": "success",
-	})
-	pay, err := s.postJSON(r, s.PaymentBase+"/v1/payments", payBody, corr)
-	if err != nil {
-		httpx.WriteError(w, 502, "ORD_PAYMENT_FAILED", err.Error(), corr, "failed", true)
-		return
-	}
-	payID, _ := pay["id"].(string)
-	o.PaymentID = &payID
-	status, _ := pay["status"].(string)
-	if status != "SUCCEEDED" {
-		_ = s.Store.Fail(r.Context(), o.ID, time.Now().UTC())
-		o.Status = "FAILED"
-		httpx.WriteJSON(w, 200, o)
-		return
-	}
-	o.Status = "PAYMENT_SUCCEEDED"
-	o.UpdatedAt = time.Now().UTC()
-	_ = s.Store.Update(r.Context(), o)
-
-	// Confirm inventory
-	conf, err := s.postJSON(r, s.InventoryBase+"/v1/reservations/"+resID+"/confirm", []byte("{}"), corr)
-	if err != nil {
-		o.Status = "RECONCILIATION_REQUIRED"
-		o.UpdatedAt = time.Now().UTC()
-		_ = s.Store.Update(r.Context(), o)
-		httpx.WriteJSON(w, 200, o)
-		return
-	}
-	if confStatus, _ := conf["status"].(string); confStatus != "CONFIRMED" {
-		o.Status = "RECONCILIATION_REQUIRED"
-		o.UpdatedAt = time.Now().UTC()
-		_ = s.Store.Update(r.Context(), o)
+		// Lost create race — resume winner
+		if o.Status != orchestrate.StatusConfirmed && o.Status != orchestrate.StatusFailed {
+			out, _ := s.Driver.Advance(r.Context(), o.ID, corr)
+			httpx.WriteJSON(w, 200, out)
+			return
+		}
 		httpx.WriteJSON(w, 200, o)
 		return
 	}
 
-	o, err = s.Store.Confirm(r.Context(), o.ID, ids.New("evt"), corr, map[string]any{
-		"order_id": o.ID, "buyer_id": o.BuyerID, "quantity": o.Quantity, "session_id": o.SessionID,
-	}, time.Now().UTC())
-	if err != nil {
-		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
+	if req.PaymentScenario != "" {
+		s.Driver.PaymentScenario = req.PaymentScenario
+	} else {
+		s.Driver.PaymentScenario = s.PaymentScenario
+	}
+	out, err := s.Driver.Advance(r.Context(), o.ID, corr)
+	if err != nil && out.Status == orchestrate.StatusFailed {
+		httpx.WriteJSON(w, 200, out)
 		return
 	}
-	httpx.WriteJSON(w, 201, o)
+	status := 201
+	if out.Status != orchestrate.StatusConfirmed {
+		status = 200
+	}
+	httpx.WriteJSON(w, status, out)
 }
 
-func (s *Server) getJSON(r *http.Request, url, corr string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+func (s *Server) fetchPolicy(ctx context.Context, sessionID, corr string) (map[string]any, error) {
+	ds := &orchestrate.HTTPDownstream{HTTP: s.HTTP, AdmissionBase: s.AdmissionBase, InventoryBase: s.InventoryBase, PaymentBase: s.PaymentBase}
+	// reuse get via temporary method — inline small get
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.SaleBase+"/v1/sessions/"+sessionID+"/purchase-policy", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -322,37 +408,14 @@ func (s *Server) getJSON(r *http.Request, url, corr string) (map[string]any, err
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s", string(b))
+		return nil, fmt.Errorf("sale policy status %d", resp.StatusCode)
 	}
 	var out map[string]any
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	return out, nil
-}
-
-func (s *Server) postJSON(r *http.Request, url string, body []byte, corr string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(httpx.HeaderCorrelationID, corr)
-	resp, err := s.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s", string(b))
-	}
-	var out map[string]any
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
+	_ = ds
 	return out, nil
 }
 

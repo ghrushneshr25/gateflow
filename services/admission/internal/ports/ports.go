@@ -19,6 +19,9 @@ type AdmissionStore interface {
 	GetBudget(ctx context.Context, scopeKey string) (store.Budget, error)
 	SetBudgetCaps(ctx context.Context, scopeKey string, maxGrants, maxActive int) error
 	MarkEventProcessed(ctx context.Context, eventID string) (bool, error)
+	GetCoordination(ctx context.Context) (store.Coordination, error)
+	FenceAdmission(ctx context.Context, reason, actor string, now time.Time) (store.Coordination, error)
+	UnfenceAdmission(ctx context.Context, actor string, now time.Time) (store.Coordination, error)
 }
 
 type APIServer interface {

@@ -82,4 +82,8 @@ test-integration-race:
 	go test -race -tags=integration -count=1 ./services/order/tests/...
 	go test -race -tags=integration -count=1 ./services/admission/tests/...
 
+# Process-kill recovery suite (slow; requires make build + postgres + optional kafka)
+test-crash-recovery:
+	go test -tags='integration crash' -count=1 -timeout 15m -v ./services/order/tests/crash/
+
 ci: fmt vet test build compose-config frontend-typecheck frontend-test frontend-build

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gateflow.local/schemas/order-order-confirmed.payload.schema.json",
+  "title": "OrderOrderConfirmedPayload",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["order_id", "buyer_id", "session_id", "quantity"],
+  "properties": {
+    "order_id": { "type": "string", "minLength": 1 },
+    "buyer_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "quantity": { "type": "integer", "minimum": 1 }
+  }
+}

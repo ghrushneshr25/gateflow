@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ghrushneshr25/nexus"
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/config"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
@@ -44,7 +45,8 @@ func main() {
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)
 	}
-	srv := httpx.NewServer(cfg.HTTPAddr, httpx.CorrelationMiddleware(mux))
+	handler := authn.Middleware(httpx.CorrelationMiddleware(mux))
+	srv := httpx.NewServer(cfg.HTTPAddr, handler)
 	go func() {
 		log.Info("listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

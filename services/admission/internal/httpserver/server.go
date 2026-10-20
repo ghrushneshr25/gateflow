@@ -6,8 +6,10 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
 	"github.com/ghrushneshrathod/gateflow/services/admission/internal/store"
@@ -23,9 +25,15 @@ type AdmissionStore interface {
 	EnsureBudgets(ctx context.Context, sessionID string, maxGrants, maxActive int) error
 	GetBudget(ctx context.Context, scopeKey string) (store.Budget, error)
 	SetBudgetCaps(ctx context.Context, scopeKey string, maxGrants, maxActive int) error
+	GetCoordination(ctx context.Context) (store.Coordination, error)
+	FenceAdmission(ctx context.Context, reason, actor string, now time.Time) (store.Coordination, error)
+	UnfenceAdmission(ctx context.Context, actor string, now time.Time) (store.Coordination, error)
 }
 
-type Server struct{ Store AdmissionStore }
+type Server struct {
+	Store            AdmissionStore
+	FencedGrantTotal atomic.Int64
+}
 
 func New(st AdmissionStore) *Server { return &Server{Store: st} }
 
@@ -38,6 +46,30 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/entitlements/{id}/consume", s.consume)
 	mux.HandleFunc("GET /v1/admin/budgets/{scope}", s.getBudget)
 	mux.HandleFunc("PUT /v1/admin/budgets/{scope}", s.putBudget)
+	mux.HandleFunc("GET /v1/admin/coordination", s.getCoordination)
+	mux.HandleFunc("POST /v1/admin/coordination/fence", s.fence)
+	mux.HandleFunc("POST /v1/admin/coordination/unfence", s.unfence)
+	mux.HandleFunc("GET /v1/admin/coordination/metrics", s.coordMetrics)
+}
+
+func (s *Server) requireOps(w http.ResponseWriter, r *http.Request, corr, scope string) (authn.Claims, bool) {
+	c, ok := authn.ClaimsFromContext(r.Context())
+	if !ok || (c.PrincipalType != "operator" && c.PrincipalType != "service") {
+		httpx.WriteError(w, 401, "ADM_UNAUTHORIZED", "valid operator/service bearer token required", corr, "failed", false)
+		return c, false
+	}
+	allowed := authn.HasScope(c, "*") || authn.HasScope(c, scope)
+	if scope == "ops:admission:read" {
+		allowed = allowed || authn.HasScope(c, "ops:admission:read") || authn.HasScope(c, "ops:admission:fence")
+	}
+	if scope == "ops:admission:fence" {
+		allowed = allowed || authn.HasScope(c, "ops:admission:fence")
+	}
+	if !allowed {
+		httpx.WriteError(w, 403, "ADM_FORBIDDEN", "insufficient scope", corr, "failed", false)
+		return c, false
+	}
+	return c, true
 }
 
 func buyerFrom(r *http.Request) string {
@@ -114,11 +146,88 @@ func (s *Server) grant(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 429, "ADM_BUDGET_EXHAUSTED", "admission grant budget exhausted", corr, "failed", true)
 		return
 	}
+	if errors.Is(err, store.ErrCoordinationFenced) {
+		s.FencedGrantTotal.Add(1)
+		httpx.WriteError(w, 503, "ADM_COORDINATION_FENCED", "new grants are fenced", corr, "failed", true)
+		return
+	}
+	if errors.Is(err, store.ErrCoordinationUnavailable) {
+		httpx.WriteError(w, 503, "ADM_COORDINATION_UNAVAILABLE", "coordination state unavailable", corr, "failed", true)
+		return
+	}
 	if err != nil {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
 	httpx.WriteJSON(w, 200, map[string]any{"queue_entry": entry, "entitlement": ent})
+}
+
+func (s *Server) getCoordination(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	if _, ok := s.requireOps(w, r, corr, "ops:admission:read"); !ok {
+		return
+	}
+	c, err := s.Store.GetCoordination(r.Context())
+	if errors.Is(err, store.ErrCoordinationUnavailable) {
+		httpx.WriteError(w, 503, "ADM_COORDINATION_UNAVAILABLE", "missing coordination state", corr, "failed", true)
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	httpx.WriteJSON(w, 200, c)
+}
+
+func (s *Server) fence(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	claims, ok := s.requireOps(w, r, corr, "ops:admission:fence")
+	if !ok {
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	c, err := s.Store.FenceAdmission(r.Context(), req.Reason, claims.Subject, time.Now().UTC())
+	if err != nil {
+		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	httpx.WriteJSON(w, 200, c)
+}
+
+func (s *Server) unfence(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	claims, ok := s.requireOps(w, r, corr, "ops:admission:fence")
+	if !ok {
+		return
+	}
+	c, err := s.Store.UnfenceAdmission(r.Context(), claims.Subject, time.Now().UTC())
+	if err != nil {
+		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
+		return
+	}
+	httpx.WriteJSON(w, 200, c)
+}
+
+func (s *Server) coordMetrics(w http.ResponseWriter, r *http.Request) {
+	corr := httpx.CorrelationID(r)
+	if _, ok := s.requireOps(w, r, corr, "ops:admission:read"); !ok {
+		return
+	}
+	c, err := s.Store.GetCoordination(r.Context())
+	mode := "unknown"
+	epoch := int64(0)
+	if err == nil {
+		mode = c.Mode
+		epoch = c.Epoch
+	}
+	httpx.WriteJSON(w, 200, map[string]any{
+		"coordination_mode":  mode,
+		"coordination_epoch": epoch,
+		"fenced_grant_total": s.FencedGrantTotal.Load(),
+	})
 }
 
 func (s *Server) getEnt(w http.ResponseWriter, r *http.Request) {

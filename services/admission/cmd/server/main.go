@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ghrushneshr25/nexus"
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/config"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
@@ -39,12 +40,13 @@ func main() {
 	mux := http.NewServeMux()
 	httpx.MountHealth(mux, cfg.Name, func() error { return readyErr })
 	mux.HandleFunc("GET /v1/meta", func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, 200, map[string]any{"service": cfg.Name, "phase": 3, "di": "nexus"})
+		httpx.WriteJSON(w, 200, map[string]any{"service": cfg.Name, "phase": 4, "di": "nexus", "coordination": "pg-fence"})
 	})
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)
 	}
-	srv := httpx.NewServer(cfg.HTTPAddr, httpx.CorrelationMiddleware(mux))
+	handler := authn.Middleware(httpx.CorrelationMiddleware(mux))
+	srv := httpx.NewServer(cfg.HTTPAddr, handler)
 	go func() {
 		log.Info("listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

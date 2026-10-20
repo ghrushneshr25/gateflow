@@ -13,7 +13,10 @@ type OrderStore interface {
 	GetByIdempotency(ctx context.Context, buyerID, key string) (store.Order, error)
 	Get(ctx context.Context, id string) (store.Order, error)
 	ListByBuyer(ctx context.Context, buyerID string) ([]store.Order, error)
+	ListByStatus(ctx context.Context, status string, limit int) ([]store.Order, error)
 	CreateWithHold(ctx context.Context, o store.Order, holdID string, now time.Time) (store.Order, error)
+	CountOutboxForAggregate(ctx context.Context, aggregateID string) (int, error)
+	CountOutboxByEventID(ctx context.Context, eventID string) (int, error)
 	Update(ctx context.Context, o store.Order) error
 	Confirm(ctx context.Context, orderID, eventID, corr string, payload any, now time.Time) (store.Order, error)
 	Fail(ctx context.Context, orderID string, now time.Time) error
