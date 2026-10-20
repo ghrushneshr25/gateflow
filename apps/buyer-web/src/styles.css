@@ -1,0 +1,39 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+  --bg: #0b1220;
+  --panel: #121a2b;
+  --text: #e8eefc;
+  --muted: #9db0d0;
+  --accent: #5b8cff;
+  --border: #24314d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #15213a, var(--bg));
+  color: var(--text);
+}
+a { color: var(--accent); text-decoration: none; }
+.shell { max-width: 960px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+.card {
+  background: color-mix(in srgb, var(--panel) 92%, white 8%);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 12px 40px rgba(0,0,0,.25);
+}
+.muted { color: var(--muted); }
+.badge {
+  display: inline-block;
+  padding: .2rem .55rem;
+  border-radius: 999px;
+  background: rgba(91,140,255,.15);
+  color: var(--accent);
+  font-size: .8rem;
+  font-weight: 600;
+}
+h1 { margin: 0 0 .35rem; font-size: 1.75rem; }
+nav { display: flex; gap: 1rem; margin: 1rem 0 1.5rem; }
