@@ -1,15 +1,15 @@
 # Gateflow Runbooks
 
-Operational recovery procedures. Expand per incident class as features land.
+Operational recovery procedures. Commands must match implemented APIs.
 
-| Runbook | Status | Phase |
+| Runbook | File | Status |
 |---|---|---|
-| Local stack bring-up | Planned | P1 |
-| Admission Redis fence and resume | Planned | P4 |
-| Order reconciliation backlog | Planned | P4 |
-| Late payment success / compensation | Planned | P4 |
-| Kafka consumer lag and replay | Planned | P4 |
-| Inventory expiry worker delay | Planned | P3 |
-| Manual compensation retry | Planned | P4–P5 |
+| Order reconciliation backlog | [reconciliation-backlog.md](./reconciliation-backlog.md) | **P5.4.0** |
+| Outbox quarantine and replay | [outbox-quarantine-replay.md](./outbox-quarantine-replay.md) | **P5.4.0** |
+| Admission coordination fence | [admission-coordination-fence.md](./admission-coordination-fence.md) | **P5.4.0** |
+| Payment ambiguity / compensation | [payment-ambiguity-compensation.md](./payment-ambiguity-compensation.md) | **P5.4.0** |
+| Local stack + observability (traces + RED/alerts) | [observability-local.md](./observability-local.md) | **P5.4.0 / P5.4.1** |
+| Inventory expiry worker delay | — | Planned |
+| Admission Redis fence | — | Deferred (PG fence is authority) |
 
-**Rule:** Runbooks must match actual implemented recovery APIs and never instruct direct cross-service DB writes.
+**Rule:** Never instruct direct cross-service DB writes. Use service APIs + operator JWT scopes.

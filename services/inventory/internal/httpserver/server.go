@@ -7,10 +7,20 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
 	"github.com/ghrushneshrathod/gateflow/services/inventory/internal/store"
 )
+
+func (s *Server) requireService(w http.ResponseWriter, r *http.Request, corr string) bool {
+	_, err := authn.RequireService(r, authn.ScopeInventoryWrite)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "INV_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return false
+	}
+	return true
+}
 
 // InventoryStore is the persistence port (mockable via nexus).
 type InventoryStore interface {
@@ -43,6 +53,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	var req struct {
 		SessionID    string `json:"session_id"`
 		TicketTypeID string `json:"ticket_type_id"`
@@ -80,6 +93,9 @@ func (s *Server) getPool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	var req struct {
 		OperationID  string `json:"operation_id"`
 		PoolID       string `json:"pool_id"`
@@ -157,6 +173,9 @@ func (s *Server) getRes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	res, err := s.Store.Confirm(r.Context(), r.PathValue("id"), time.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "INV_NOT_FOUND", "reservation not found", corr, "failed", false)
@@ -179,6 +198,9 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	res, err := s.Store.Release(r.Context(), r.PathValue("id"), time.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "INV_NOT_FOUND", "reservation not found", corr, "failed", false)
@@ -197,6 +219,9 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) expire(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	res, err := s.Store.Expire(r.Context(), r.PathValue("id"), time.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "INV_NOT_FOUND", "reservation not found", corr, "failed", false)
@@ -215,6 +240,9 @@ func (s *Server) expire(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) expireDue(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr) {
+		return
+	}
 	n, err := s.Store.ExpireDue(r.Context(), time.Now().UTC(), 200)
 	if err != nil {
 		httpx.WriteError(w, 500, "INV_INTERNAL", err.Error(), corr, "failed", true)

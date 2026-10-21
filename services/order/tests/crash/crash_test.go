@@ -13,10 +13,45 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
 	"github.com/ghrushneshrathod/gateflow/libs/go/postgres"
 	orderstore "github.com/ghrushneshrathod/gateflow/services/order/internal/store"
 )
+
+func crashSecret() string {
+	return envOr("GATEFLOW_DEV_JWT_SECRET", authn.DefaultDevSecret)
+}
+
+func opsSaleToken(t *testing.T) string {
+	t.Helper()
+	tok, err := authn.MintOperatorJWT(crashSecret(), "crash-ops", []string{authn.ScopeSaleWrite, authn.ScopeSalePublish}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+func buyerToken(t *testing.T, buyerID string) string {
+	t.Helper()
+	tok, err := authn.MintBuyerJWT(crashSecret(), buyerID, nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+func svcToken(t *testing.T, scopes ...string) string {
+	t.Helper()
+	if len(scopes) == 0 {
+		scopes = authn.OrderServiceScopes
+	}
+	tok, err := authn.MintServiceJWT(crashSecret(), "crash-svc", scopes, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
 
 func dbURL() string {
 	if v := os.Getenv("DATABASE_URL"); v != "" {
@@ -26,6 +61,9 @@ func dbURL() string {
 }
 
 func baseEnv(hookDir string) []string {
+	secret := crashSecret()
+	svc, _ := authn.MintServiceJWT(secret, "order-service", authn.OrderServiceScopes, 24*time.Hour)
+	saleSvc, _ := authn.MintServiceJWT(secret, "sale-service", authn.SaleServiceScopes, 24*time.Hour)
 	return []string{
 		"DATABASE_URL=" + dbURL(),
 		"ORDER_DATABASE_URL=" + dbURL(),
@@ -42,6 +80,11 @@ func baseEnv(hookDir string) []string {
 		"GATEFLOW_TEST_HOOKS=1",
 		"GATEFLOW_HOOK_DIR=" + hookDir,
 		"GATEFLOW_CRASH_DELAY_MS=50",
+		"GATEFLOW_DEV_JWT_SECRET=" + secret,
+		"ENVIRONMENT=local",
+		"GATEFLOW_SERVICE_TOKEN=" + svc,
+		// sale process also mints; ensure secret shared
+		"GATEFLOW_SALE_SERVICE_TOKEN=" + saleSvc,
 	}
 }
 
@@ -157,7 +200,9 @@ func getJSON(t *testing.T, url string, headers map[string]string) (int, map[stri
 func setupBooking(t *testing.T) (buyer, sessionID, ttID, poolID, entID string) {
 	t.Helper()
 	buyer = ids.New("buyer")
-	_, off := postJSON(t, "http://127.0.0.1:8081/v1/offerings", nil, map[string]any{
+	ops := map[string]string{"Authorization": "Bearer " + opsSaleToken(t)}
+	grantAuth := map[string]string{"Authorization": "Bearer " + svcToken(t, authn.ScopeAdmissionGrant)}
+	_, off := postJSON(t, "http://127.0.0.1:8081/v1/offerings", ops, map[string]any{
 		"name": "crash-" + buyer, "category": "concert",
 	})
 	offID, _ := off["id"].(string)
@@ -165,22 +210,22 @@ func setupBooking(t *testing.T) (buyer, sessionID, ttID, poolID, entID string) {
 	end := time.Now().UTC().Add(52 * time.Hour).Format(time.RFC3339)
 	open := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
 	closeT := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
-	_, sess := postJSON(t, "http://127.0.0.1:8081/v1/offerings/"+offID+"/sessions", nil, map[string]any{
+	_, sess := postJSON(t, "http://127.0.0.1:8081/v1/offerings/"+offID+"/sessions", ops, map[string]any{
 		"starts_at": start, "ends_at": end, "sale_opens_at": open, "sale_closes_at": closeT, "max_per_buyer": 4,
 	})
 	sessionID, _ = sess["session"].(map[string]any)["id"].(string)
-	_, tt := postJSON(t, "http://127.0.0.1:8081/v1/sessions/"+sessionID+"/ticket-types", nil, map[string]any{
+	_, tt := postJSON(t, "http://127.0.0.1:8081/v1/sessions/"+sessionID+"/ticket-types", ops, map[string]any{
 		"name": "GA", "capacity": 5, "price_cents": 1000,
 	})
 	ttID, _ = tt["id"].(string)
-	_, pub := postJSON(t, "http://127.0.0.1:8081/v1/offerings/"+offID+"/publish", nil, map[string]any{})
+	_, pub := postJSON(t, "http://127.0.0.1:8081/v1/offerings/"+offID+"/publish", ops, map[string]any{})
 	tts, _ := pub["ticket_types"].([]any)
 	if len(tts) == 0 {
 		t.Fatalf("publish: %#v", pub)
 	}
 	poolID, _ = tts[0].(map[string]any)["inventory_pool_id"].(string)
-	postJSON(t, "http://127.0.0.1:8082/v1/sessions/"+sessionID+"/queue/joins", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
-	_, grant := postJSON(t, "http://127.0.0.1:8082/v1/sessions/"+sessionID+"/grants", nil, map[string]any{"buyer_id": buyer})
+	postJSON(t, "http://127.0.0.1:8082/v1/sessions/"+sessionID+"/queue/joins", buyerHdr(t, buyer, ""), map[string]any{})
+	_, grant := postJSON(t, "http://127.0.0.1:8082/v1/sessions/"+sessionID+"/grants", grantAuth, map[string]any{"buyer_id": buyer})
 	ent, _ := grant["entitlement"].(map[string]any)
 	entID, _ = ent["id"].(string)
 	if entID == "" || poolID == "" {
@@ -227,6 +272,14 @@ func waitDead(p *Proc, d time.Duration) {
 	_ = p.Kill()
 }
 
+func buyerHdr(t *testing.T, buyer, key string) map[string]string {
+	h := map[string]string{"Authorization": "Bearer " + buyerToken(t, buyer)}
+	if key != "" {
+		h["Idempotency-Key"] = key
+	}
+	return h
+}
+
 func checkoutBody(sessionID, ttID, poolID, entID, key string) map[string]any {
 	return map[string]any{
 		"session_id": sessionID, "ticket_type_id": ttID, "pool_id": poolID,
@@ -239,7 +292,7 @@ func TestCrashA_PaymentSuccessLostResponse(t *testing.T) {
 	buyer, sessionID, ttID, poolID, entID := setupBooking(t)
 	key := ids.New("key")
 	body := checkoutBody(sessionID, ttID, poolID, entID, key)
-	hdr := map[string]string{"X-Buyer-ID": buyer, "Idempotency-Key": key}
+	hdr := buyerHdr(t, buyer, key)
 
 	go func() { _, _, _ = postJSONErr("http://127.0.0.1:8084/v1/checkouts", hdr, body) }()
 
@@ -262,7 +315,7 @@ func TestCrashA_PaymentSuccessLostResponse(t *testing.T) {
 			break
 		}
 		if oid != "" {
-			_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+			_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 			if ord, ok := body2["order"].(map[string]any); ok {
 				status, _ = ord["status"].(string)
 				if p2, _ := ord["payment_operation_id"].(string); p2 != "" {
@@ -278,7 +331,7 @@ func TestCrashA_PaymentSuccessLostResponse(t *testing.T) {
 	if payOp == "" || oid == "" {
 		t.Fatalf("missing ids status=%s", status)
 	}
-	pc, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, nil)
+	pc, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, map[string]string{"Authorization": "Bearer " + svcToken(t, authn.ScopePaymentCreate)})
 	if pc != 200 || pay["status"] != "SUCCEEDED" {
 		t.Fatalf("pay %d %#v", pc, pay)
 	}
@@ -308,7 +361,7 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 	buyer, sessionID, ttID, poolID, entID := setupBooking(t)
 	key := ids.New("key")
 	body := checkoutBody(sessionID, ttID, poolID, entID, key)
-	hdr := map[string]string{"X-Buyer-ID": buyer, "Idempotency-Key": key}
+	hdr := buyerHdr(t, buyer, key)
 
 	go func() { _, _, _ = postJSONErr("http://127.0.0.1:8084/v1/checkouts", hdr, body) }()
 	if err := waitFile(filepath.Join(s.hookDir, "reached_after_payment_success"), 25*time.Second); err != nil {
@@ -337,11 +390,12 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 	resID := *o.ReservationID
 	invOp := o.InventoryOperationID
 
-	pc, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, nil)
+	pc, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, map[string]string{"Authorization": "Bearer " + svcToken(t, authn.ScopePaymentCreate)})
 	if pc != 200 || pay["status"] != "SUCCEEDED" {
 		t.Fatalf("durable payment %#v", pay)
 	}
-	code, rel := postJSON(t, "http://127.0.0.1:8083/v1/reservations/"+resID+"/release", nil, map[string]any{})
+	invAuth := map[string]string{"Authorization": "Bearer " + svcToken(t, authn.ScopeInventoryWrite)}
+	code, rel := postJSON(t, "http://127.0.0.1:8083/v1/reservations/"+resID+"/release", invAuth, map[string]any{})
 	if code >= 500 {
 		t.Fatalf("release %d %#v", code, rel)
 	}
@@ -370,7 +424,7 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 	if err := waitFile(filepath.Join(s.hookDir, "reached_after_compensation_created"), 25*time.Second); err != nil {
 		// try reconcile as alternate trigger
 		go func() {
-			_, _, _ = postJSONErr("http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+			_, _, _ = postJSONErr("http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 		}()
 		if err2 := waitFile(filepath.Join(s.hookDir, "reached_after_compensation_created"), 15*time.Second); err2 != nil {
 			t.Fatalf("compensation barrier: %v / %v log=%s", err, err2, fmtLog(s.order))
@@ -398,7 +452,7 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 	}
 	var finalStatus, finalComp string
 	for i := 0; i < 12; i++ {
-		_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+		_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 		if ord, ok := body2["order"].(map[string]any); ok {
 			finalStatus, _ = ord["status"].(string)
 			finalComp, _ = ord["compensation_operation_id"].(string)
@@ -427,7 +481,7 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 	}
 	if o3.Status != "RECONCILIATION_REQUIRED" {
 		// one more advance
-		_, _ = postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+		_, _ = postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 		o3, _ = st.Get(context.Background(), oid)
 	}
 	if o3.Status != "RECONCILIATION_REQUIRED" {
@@ -451,7 +505,7 @@ func TestCrashB_CompensationInterruptedAfterINVExpired(t *testing.T) {
 		t.Fatalf("reservation revived %#v", inv2)
 	}
 	// Second recovery is idempotent
-	_, body3 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+	_, body3 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 	if ord, ok := body3["order"].(map[string]any); ok {
 		if ord["status"] == "CONFIRMED" {
 			t.Fatal("second reconcile confirmed")
@@ -476,7 +530,7 @@ func TestCrashC_PublisherAfterKafkaAck(t *testing.T) {
 	})
 	buyer, sessionID, ttID, poolID, entID := setupBooking(t)
 	key := ids.New("key")
-	hdr := map[string]string{"X-Buyer-ID": buyer, "Idempotency-Key": key}
+	hdr := buyerHdr(t, buyer, key)
 	bodyReq := checkoutBody(sessionID, ttID, poolID, entID, key)
 
 	code, body := postJSON(t, "http://127.0.0.1:8084/v1/checkouts", hdr, bodyReq)
@@ -550,7 +604,7 @@ func TestCrashD_ConsumerAfterDBBeforeOffset(t *testing.T) {
 	})
 	buyer, sessionID, ttID, poolID, entID := setupBooking(t)
 	key := ids.New("key")
-	hdr := map[string]string{"X-Buyer-ID": buyer, "Idempotency-Key": key}
+	hdr := buyerHdr(t, buyer, key)
 	bodyReq := checkoutBody(sessionID, ttID, poolID, entID, key)
 
 	// Confirm + outbox row without publishing yet... need publisher for kafka.
@@ -625,7 +679,7 @@ func TestCrashE_RepeatedRestartPayment(t *testing.T) {
 	buyer, sessionID, ttID, poolID, entID := setupBooking(t)
 	key := ids.New("key")
 	bodyReq := checkoutBody(sessionID, ttID, poolID, entID, key)
-	hdr := map[string]string{"X-Buyer-ID": buyer, "Idempotency-Key": key}
+	hdr := buyerHdr(t, buyer, key)
 	go func() { _, _, _ = postJSONErr("http://127.0.0.1:8084/v1/checkouts", hdr, bodyReq) }()
 	_ = waitFile(filepath.Join(s.hookDir, "reached_after_payment_success"), 25*time.Second)
 	_ = s.order.Kill()
@@ -652,7 +706,7 @@ func TestCrashE_RepeatedRestartPayment(t *testing.T) {
 			break
 		}
 		if oid, _ := body["id"].(string); oid != "" {
-			_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", map[string]string{"X-Buyer-ID": buyer}, map[string]any{})
+			_, body2 := postJSON(t, "http://127.0.0.1:8084/v1/orders/"+oid+"/reconcile", buyerHdr(t, buyer, ""), map[string]any{})
 			if ord, ok := body2["order"].(map[string]any); ok {
 				body = ord
 			}
@@ -666,7 +720,7 @@ func TestCrashE_RepeatedRestartPayment(t *testing.T) {
 	if payOp == "" {
 		t.Fatal("missing pay op")
 	}
-	_, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, nil)
+	_, pay := getJSON(t, "http://127.0.0.1:8085/v1/payments/by-operation/"+payOp, map[string]string{"Authorization": "Bearer " + svcToken(t, authn.ScopePaymentCreate)})
 	if pay["status"] != "SUCCEEDED" {
 		t.Fatalf("%#v", pay)
 	}

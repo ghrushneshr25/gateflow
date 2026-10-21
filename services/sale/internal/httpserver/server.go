@@ -10,10 +10,31 @@ import (
 	"os"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
 	"github.com/ghrushneshrathod/gateflow/services/sale/internal/store"
 )
+
+func (s *Server) requireOps(w http.ResponseWriter, r *http.Request, corr string, scopes ...string) bool {
+	_, err := authn.RequireOperator(r, scopes...)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "SALE_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return false
+	}
+	return true
+}
+
+func serviceToken() string {
+	if t := os.Getenv("GATEFLOW_SERVICE_TOKEN"); t != "" {
+		return t
+	}
+	tok, err := authn.MintServiceJWT(os.Getenv("GATEFLOW_DEV_JWT_SECRET"), "sale-service", authn.SaleServiceScopes, 24*time.Hour)
+	if err != nil {
+		return ""
+	}
+	return tok
+}
 
 type SaleStore interface {
 	CreateOffering(ctx context.Context, o store.Offering) error
@@ -44,12 +65,12 @@ func New(st *store.Store) *Server {
 	if base == "" {
 		base = "http://127.0.0.1:8083"
 	}
-	return NewWithDeps(st, &http.Client{Timeout: 5 * time.Second}, base)
+	return NewWithDeps(st, httpx.NewClient(5*time.Second), base)
 }
 
 func NewWithDeps(st SaleStore, httpDoer HTTPDoer, inventoryBase string) *Server {
 	if httpDoer == nil {
-		httpDoer = &http.Client{Timeout: 5 * time.Second}
+		httpDoer = httpx.NewClient(5 * time.Second)
 	}
 	if inventoryBase == "" {
 		inventoryBase = "http://127.0.0.1:8083"
@@ -71,6 +92,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 func (s *Server) createOffering(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireOps(w, r, corr, authn.ScopeSaleWrite) {
+		return
+	}
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
@@ -125,6 +149,9 @@ func (s *Server) getOffering(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireOps(w, r, corr, authn.ScopeSaleWrite) {
+		return
+	}
 	offeringID := r.PathValue("id")
 	if _, err := s.Store.GetOffering(r.Context(), offeringID); errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "SALE_NOT_FOUND", "offering not found", corr, "failed", false)
@@ -184,6 +211,9 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createTicketType(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireOps(w, r, corr, authn.ScopeSaleWrite) {
+		return
+	}
 	sessionID := r.PathValue("id")
 	if _, err := s.Store.GetSession(r.Context(), sessionID); errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "SALE_NOT_FOUND", "session not found", corr, "failed", false)
@@ -246,6 +276,9 @@ func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireOps(w, r, corr, authn.ScopeSalePublish, authn.ScopeSaleWrite) {
+		return
+	}
 	o, sessions, tts, err := s.Store.PublishOffering(r.Context(), r.PathValue("id"), time.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "SALE_NOT_FOUND", "offering not found", corr, "failed", false)
@@ -297,6 +330,9 @@ func (s *Server) ensurePool(ctx context.Context, tt store.TicketType, corr strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(httpx.HeaderCorrelationID, corr)
+	if tok := serviceToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
 		return "", err

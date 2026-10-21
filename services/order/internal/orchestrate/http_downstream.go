@@ -248,6 +248,16 @@ func WithServiceToken(ctx context.Context, token string) context.Context {
 
 var ErrNotFound = fmt.Errorf("not found")
 
+func (h *HTTPDownstream) bearer(ctx context.Context) string {
+	token := h.ServiceToken
+	if tok := ctx.Value(ctxServiceToken{}); tok != nil {
+		if s, ok := tok.(string); ok && s != "" {
+			token = s
+		}
+	}
+	return token
+}
+
 func (h *HTTPDownstream) post(ctx context.Context, url string, body []byte, corr string) (map[string]any, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -255,6 +265,9 @@ func (h *HTTPDownstream) post(ctx context.Context, url string, body []byte, corr
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Correlation-ID", corr)
+	if tok := h.bearer(ctx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := h.HTTP.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -275,6 +288,9 @@ func (h *HTTPDownstream) get(ctx context.Context, url, corr string) (map[string]
 		return nil, 0, err
 	}
 	req.Header.Set("X-Correlation-ID", corr)
+	if tok := h.bearer(ctx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := h.HTTP.Do(req)
 	if err != nil {
 		return nil, 0, err

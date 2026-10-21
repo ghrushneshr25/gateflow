@@ -1,0 +1,57 @@
+groups:
+  - name: gateflow-ops
+    rules:
+      # 1) Outbox lag — oldest unpublished event age
+      - alert: GateflowOutboxOldestAgeHigh
+        expr: gateflow_outbox_oldest_age_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox oldest unpublished event age high"
+          description: "Oldest unpublished outbox row is {{ $value | humanizeDuration }} old (threshold 2m). Check Kafka connectivity and publisher health."
+          runbook: "docs/runbooks/outbox-quarantine-replay.md"
+
+      # 2) Quarantine — any quarantined outbox row needs operator action
+      - alert: GateflowOutboxQuarantineNonZero
+        expr: gateflow_outbox_quarantined > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox quarantine count > 0"
+          description: "{{ $value }} outbox row(s) quarantined. Inspect /v1/admin/outbox/quarantined and replay or fix payload."
+          runbook: "docs/runbooks/outbox-quarantine-replay.md"
+
+      # 3) Reconciliation backlog
+      - alert: GateflowReconciliationBacklogHigh
+        expr: gateflow_order_reconciliation_required > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order reconciliation backlog high"
+          description: "{{ $value }} orders in RECONCILIATION_REQUIRED (threshold 5 for 5m). Run operator recover / advance."
+          runbook: "docs/runbooks/reconciliation-backlog.md"
+
+      # Optional: admission fenced
+      - alert: GateflowAdmissionFenced
+        expr: gateflow_admission_coordination_fenced == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admission coordination is FENCED"
+          description: "New grants are blocked. Unfence only after Redis/coordination recovery is verified."
+          runbook: "docs/runbooks/admission-coordination-fence.md"
+
+      # Optional: scrape target down (missing metrics ≠ healthy)
+      - alert: GateflowServiceTargetDown
+        expr: up{job="gateflow-services"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateflow service metrics target down"
+          description: "Prometheus cannot scrape {{ $labels.service }} ({{ $labels.instance }}). Booking may still work; observability is degraded."
+          runbook: "docs/runbooks/observability-local.md"

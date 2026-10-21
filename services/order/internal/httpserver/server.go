@@ -15,6 +15,7 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/orchestrate"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/store"
 )
@@ -58,7 +59,7 @@ type Server struct {
 }
 
 func New(st *store.Store) *Server {
-	return NewWithDeps(st, &http.Client{Timeout: 5 * time.Second}, Deps{
+	return NewWithDeps(st, httpx.NewClient(5*time.Second), Deps{
 		SaleBase:      env("SALE_BASE_URL", "http://127.0.0.1:8081"),
 		AdmissionBase: env("ADMISSION_BASE_URL", "http://127.0.0.1:8082"),
 		InventoryBase: env("INVENTORY_BASE_URL", "http://127.0.0.1:8083"),
@@ -68,7 +69,7 @@ func New(st *store.Store) *Server {
 
 func NewWithDeps(st OrderStore, httpDoer HTTPDoer, deps Deps) *Server {
 	if httpDoer == nil {
-		httpDoer = &http.Client{Timeout: 5 * time.Second}
+		httpDoer = httpx.NewClient(5 * time.Second)
 	}
 	s := &Server{
 		Store:           st,
@@ -98,17 +99,12 @@ func NewWithDeps(st OrderStore, httpDoer HTTPDoer, deps Deps) *Server {
 	return s
 }
 
-// serviceTokenFromEnv returns GATEFLOW_SERVICE_TOKEN or a minted service JWT for S2S recover calls.
+// serviceTokenFromEnv returns GATEFLOW_SERVICE_TOKEN or a minted least-privilege service JWT.
 func serviceTokenFromEnv() string {
 	if t := os.Getenv("GATEFLOW_SERVICE_TOKEN"); t != "" {
 		return t
 	}
-	signer := authn.NewDevSigner(os.Getenv("GATEFLOW_DEV_JWT_SECRET"))
-	tok, err := signer.Sign(authn.Claims{
-		Subject:       "order-service",
-		PrincipalType: "service",
-		Scopes:        []string{"ops:payment:recover", "ops:order:recover", "*"},
-	}, 24*time.Hour)
+	tok, err := authn.MintServiceJWT(os.Getenv("GATEFLOW_DEV_JWT_SECRET"), "order-service", authn.OrderServiceScopes, 24*time.Hour)
 	if err != nil {
 		return ""
 	}
@@ -130,20 +126,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/admin/reconciliation", s.listReconciliation)
 }
 
-func buyer(r *http.Request) string {
-	if b := r.Header.Get("X-Buyer-ID"); b != "" {
-		return b
-	}
-	return r.URL.Query().Get("buyer_id")
-}
-
 func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
-	b := buyer(r)
-	if b == "" {
-		httpx.WriteError(w, 401, "ORD_UNAUTHORIZED", "buyer required", corr, "failed", false)
+	c, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ORD_UNAUTHORIZED", "buyer JWT required", corr, "failed", false)
 		return
 	}
+	b := authn.BuyerID(c)
 	items, err := s.Store.ListByBuyer(r.Context(), b)
 	if err != nil {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
@@ -166,8 +156,18 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
-	b := buyer(r)
-	if b != "" && o.BuyerID != b {
+	// Ops/service with order read/recover may access any order.
+	if _, err := authn.RequireOperatorOrService(r, authn.ScopeOrderRead, authn.ScopeOrderRecover); err == nil {
+		httpx.WriteJSON(w, 200, o)
+		return
+	}
+	// Buyer JWT only — X-Buyer-ID is ignored for authorization.
+	bc, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ORD_UNAUTHORIZED", "buyer JWT or operator token required", corr, "failed", false)
+		return
+	}
+	if o.BuyerID != authn.BuyerID(bc) {
 		httpx.WriteError(w, 403, "ORD_FORBIDDEN", "not owner", corr, "failed", false)
 		return
 	}
@@ -175,15 +175,10 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) requireOpsOrService(w http.ResponseWriter, r *http.Request, corr, scope string) bool {
-	c, ok := authn.ClaimsFromContext(r.Context())
-	if !ok || !authn.IsOperatorOrService(c, scope) {
-		// Accept operator/service with recover scopes
-		if ok && (c.PrincipalType == "operator" || c.PrincipalType == "service") {
-			if authn.HasScope(c, scope) || authn.HasScope(c, "ops:order:recover") || authn.HasScope(c, "*") {
-				return true
-			}
-		}
-		httpx.WriteError(w, 401, "ORD_UNAUTHORIZED", "valid operator/service bearer token required", corr, "failed", false)
+	scopes := []string{scope, authn.ScopeOrderRecover}
+	_, err := authn.RequireOperatorOrService(r, scopes...)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ORD_UNAUTHORIZED", err.Error(), corr, "failed", false)
 		return false
 	}
 	return true
@@ -221,32 +216,38 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
-	// Authorization: owner buyer OR verified ops/service JWT.
-	c, ok := authn.ClaimsFromContext(r.Context())
-	opsOK := ok && authn.IsOperatorOrService(c, "ops:order:recover")
-	if !opsOK && ok && (c.PrincipalType == "operator" || c.PrincipalType == "service") &&
-		(authn.HasScope(c, "ops:order:recover") || authn.HasScope(c, "*")) {
+	// Authorization: verified buyer owner OR ops/service with recover scope.
+	opsOK := false
+	if _, err := authn.RequireOperatorOrService(r, authn.ScopeOrderRecover); err == nil {
 		opsOK = true
 	}
-	b := buyer(r)
 	if !opsOK {
-		if b == "" || o.BuyerID != b {
-			httpx.WriteError(w, 403, "ORD_FORBIDDEN", "not owner; operator/service JWT required for cross-buyer reconcile", corr, "failed", false)
+		bc, err := authn.RequireBuyer(r)
+		if err != nil {
+			httpx.WriteError(w, authn.StatusCode(err), "ORD_UNAUTHORIZED", "buyer JWT or operator token required", corr, "failed", false)
+			return
+		}
+		if o.BuyerID != authn.BuyerID(bc) {
+			httpx.WriteError(w, 403, "ORD_FORBIDDEN", "not owner", corr, "failed", false)
 			return
 		}
 	}
 	ctx := r.Context()
-	if tok := bearerToken(r); tok != "" {
-		ctx = orchestrate.WithServiceToken(ctx, tok)
+	// Prefer configured service token for S2S; do not forward buyer token downstream.
+	if ds, ok := s.Driver.Downstream.(*orchestrate.HTTPDownstream); ok && ds.ServiceToken != "" {
+		ctx = orchestrate.WithServiceToken(ctx, ds.ServiceToken)
 	}
 	out, err := s.Driver.Advance(ctx, o.ID, corr)
 	if err != nil && out.ID == "" {
+		metrics.OrderReconcile("error")
 		httpx.WriteError(w, 500, "ORD_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	res := reconcileResult(out.Status)
+	metrics.OrderReconcile(res)
 	httpx.WriteJSON(w, 200, map[string]any{
 		"order":  out,
-		"result": reconcileResult(out.Status),
+		"result": res,
 	})
 }
 
@@ -273,27 +274,29 @@ func reconcileResult(status string) string {
 
 func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
-	b := buyer(r)
+	bc, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ORD_UNAUTHORIZED", "buyer JWT required", corr, "failed", false)
+		return
+	}
+	b := authn.BuyerID(bc)
 	var req struct {
-		BuyerID        string `json:"buyer_id"`
-		SessionID      string `json:"session_id"`
-		TicketTypeID   string `json:"ticket_type_id"`
-		PoolID         string `json:"pool_id"`
-		EntitlementID  string `json:"entitlement_id"`
-		Quantity       int    `json:"quantity"`
-		AmountCents    int64  `json:"amount_cents"`
-		Currency       string `json:"currency"`
-		IdempotencyKey string `json:"idempotency_key"`
+		BuyerID         string `json:"buyer_id"` // ignored if present; identity from JWT only
+		SessionID       string `json:"session_id"`
+		TicketTypeID    string `json:"ticket_type_id"`
+		PoolID          string `json:"pool_id"`
+		EntitlementID   string `json:"entitlement_id"`
+		Quantity        int    `json:"quantity"`
+		AmountCents     int64  `json:"amount_cents"`
+		Currency        string `json:"currency"`
+		IdempotencyKey  string `json:"idempotency_key"`
 		PaymentScenario string `json:"payment_scenario"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpx.WriteError(w, 400, "ORD_VALIDATION_FAILED", "invalid body", corr, "failed", false)
 		return
 	}
-	if b == "" {
-		b = req.BuyerID
-	}
-	if b == "" || req.SessionID == "" || req.TicketTypeID == "" || req.PoolID == "" || req.EntitlementID == "" || req.Quantity <= 0 {
+	if req.SessionID == "" || req.TicketTypeID == "" || req.PoolID == "" || req.EntitlementID == "" || req.Quantity <= 0 {
 		httpx.WriteError(w, 400, "ORD_VALIDATION_FAILED", "missing required fields", corr, "failed", false)
 		return
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ghrushneshr25/nexus"
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/appnexus"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/app"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/httpserver"
@@ -21,6 +22,7 @@ import (
 // mockStore is a test double registered through nexus.
 type mockStore struct {
 	byKey map[string]store.Order
+	byID  map[string]store.Order
 }
 
 func (m *mockStore) GetByIdempotency(_ context.Context, buyerID, key string) (store.Order, error) {
@@ -30,7 +32,12 @@ func (m *mockStore) GetByIdempotency(_ context.Context, buyerID, key string) (st
 	}
 	return o, nil
 }
-func (m *mockStore) Get(context.Context, string) (store.Order, error) {
+func (m *mockStore) Get(_ context.Context, id string) (store.Order, error) {
+	if m.byID != nil {
+		if o, ok := m.byID[id]; ok {
+			return o, nil
+		}
+	}
 	return store.Order{}, store.ErrNotFound
 }
 func (m *mockStore) ListByBuyer(context.Context, string) ([]store.Order, error) { return nil, nil }
@@ -97,12 +104,17 @@ func TestCheckoutIdempotentReplay_ViaNexusMock(t *testing.T) {
 		"pool_id": "pool", "entitlement_id": "ent", "quantity": 1,
 		"amount_cents": 100, "idempotency_key": "key-1",
 	})
+	tok, err := authn.MintBuyerJWT(authn.DefaultDevSecret, "buyer_1", nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := authn.Middleware(mux)
 	req := httptest.NewRequest(http.MethodPost, "/v1/checkouts", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Buyer-ID", "buyer_1")
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Idempotency-Key", "key-1")
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
+	handler.ServeHTTP(rr, req)
 
 	if rr.Code != 200 {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())

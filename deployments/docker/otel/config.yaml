@@ -2,14 +2,25 @@ receivers:
   otlp:
     protocols:
       grpc:
+        endpoint: 0.0.0.0:4317
       http:
+        endpoint: 0.0.0.0:4318
 
 processors:
   batch:
+    timeout: 2s
+    send_batch_size: 64
 
 exporters:
-  logging:
-    loglevel: info
+  # Debug to collector logs
+  debug:
+    verbosity: basic
+  # Traces → Tempo
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Metrics scrape endpoint for Prometheus
   prometheus:
     endpoint: "0.0.0.0:8889"
 
@@ -18,12 +29,14 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging]
+      exporters: [otlp/tempo, debug]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [prometheus, logging]
+      exporters: [prometheus, debug]
+    # App logs remain JSON on stdout; Loki via Docker log driver or P5.4.1 filelog.
+    # Keep logs pipeline ready for future OTLP log export.
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging]
+      exporters: [debug]

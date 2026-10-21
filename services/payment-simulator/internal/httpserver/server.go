@@ -12,6 +12,7 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/services/payment-simulator/internal/store"
 )
 
@@ -52,15 +53,19 @@ func (s *Server) Routes(mux *http.ServeMux) {
 }
 
 func (s *Server) requireServiceOrOps(w http.ResponseWriter, r *http.Request, corr, scope string) bool {
-	c, ok := authn.ClaimsFromContext(r.Context())
-	if !ok || !authn.IsOperatorOrService(c, scope) {
-		// Also accept service JWT without specific scope if scope empty check failed — try recover scopes
-		if ok && (c.PrincipalType == "service" || c.PrincipalType == "operator") {
-			if scope == "" || authn.HasScope(c, scope) || authn.HasScope(c, "ops:payment:recover") || authn.HasScope(c, "payment:callback") {
-				return true
-			}
-		}
-		httpx.WriteError(w, 401, "PAY_UNAUTHORIZED", "valid operator/service bearer token required", corr, "failed", false)
+	// Exact scope required (no OR across callback vs recover families).
+	_, err := authn.RequireOperatorOrService(r, scope)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "PAY_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return false
+	}
+	return true
+}
+
+func (s *Server) requireService(w http.ResponseWriter, r *http.Request, corr, scope string) bool {
+	_, err := authn.RequireService(r, scope)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "PAY_UNAUTHORIZED", err.Error(), corr, "failed", false)
 		return false
 	}
 	return true
@@ -68,6 +73,9 @@ func (s *Server) requireServiceOrOps(w http.ResponseWriter, r *http.Request, cor
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr, authn.ScopePaymentCreate) {
+		return
+	}
 	var req struct {
 		OperationID       string `json:"operation_id"`
 		OrderID           string `json:"order_id"`
@@ -114,14 +122,17 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		Status: status, ResolveAfter: resolveAfter, CreatedAt: now, UpdatedAt: now,
 	})
 	if errors.Is(err, store.ErrIdempotency) {
+		metrics.PaymentOutcome("error")
 		httpx.WriteError(w, 409, "PAY_IDEMPOTENCY_CONFLICT", "conflict", corr, "conflict", false)
 		return
 	}
 	if err != nil {
+		metrics.PaymentOutcome("error")
 		httpx.WriteError(w, 500, "PAY_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
 	if p.Status == "SUCCEEDED" || p.Status == "FAILED" {
+		metrics.PaymentOutcome(strings.ToLower(p.Status))
 		httpx.WriteJSON(w, 200, p)
 		return
 	}
@@ -132,14 +143,36 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		p, err = s.Store.UpdateStatus(r.Context(), p.ID, "FAILED", time.Now().UTC())
 	}
 	if err != nil {
+		metrics.PaymentOutcome("error")
 		httpx.WriteError(w, 500, "PAY_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	metrics.PaymentOutcome(paymentOutcomeLabel(p.Status))
 	httpx.WriteJSON(w, 201, p)
+}
+
+func paymentOutcomeLabel(status string) string {
+	switch strings.ToUpper(status) {
+	case "SUCCEEDED":
+		return "succeeded"
+	case "FAILED":
+		return "failed"
+	case "PENDING":
+		return "pending"
+	case "UNKNOWN":
+		return "unknown"
+	default:
+		return "error"
+	}
 }
 
 func (s *Server) byOp(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	// Service or operator with create/recover may look up (order S2S uses payment:create).
+	if _, err := authn.RequireOperatorOrService(r, authn.ScopePaymentCreate, authn.ScopePaymentRecover); err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "PAY_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return
+	}
 	// Auto-resolve due delayed payments on lookup (deterministic without sleep in callers).
 	_, _ = s.Store.ResolveDue(r.Context(), time.Now().UTC(), 50)
 	p, err := s.Store.GetByOperation(r.Context(), r.PathValue("operation_id"))
@@ -184,6 +217,9 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resolveDue(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireServiceOrOps(w, r, corr, authn.ScopePaymentRecover) {
+		return
+	}
 	n, err := s.Store.ResolveDue(r.Context(), time.Now().UTC(), 200)
 	if err != nil {
 		httpx.WriteError(w, 500, "PAY_INTERNAL", err.Error(), corr, "failed", true)
@@ -233,11 +269,26 @@ func (s *Server) createComp(w http.ResponseWriter, r *http.Request) {
 		forceFail := strings.Contains(pay.Scenario, "compensation_fail")
 		c, err = s.Store.ExecuteCompensationAttempt(r.Context(), opID, forceFail, time.Now().UTC())
 		if err != nil {
+			metrics.CompensationOutcome("error")
 			httpx.WriteError(w, 500, "PAY_INTERNAL", err.Error(), corr, "failed", true)
 			return
 		}
 	}
+	metrics.CompensationOutcome(compensationOutcomeLabel(c.Status))
 	httpx.WriteJSON(w, 200, c)
+}
+
+func compensationOutcomeLabel(status string) string {
+	switch strings.ToUpper(status) {
+	case "SUCCEEDED":
+		return "succeeded"
+	case "FAILED":
+		return "failed"
+	case "CREATED":
+		return "created"
+	default:
+		return "error"
+	}
 }
 
 func (s *Server) getCompByOp(w http.ResponseWriter, r *http.Request) {

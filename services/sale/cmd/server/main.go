@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ghrushneshr25/nexus"
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/config"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
@@ -21,6 +22,10 @@ func main() {
 	cfg := config.LoadService("sale", ":8081")
 	log := logging.New(cfg.Name, cfg.LogLevel)
 	defer telemetry.Init(log, cfg.Name)()
+	if err := authn.MustValidateProductionSecret(); err != nil {
+		log.Error("auth config", "err", err)
+		os.Exit(1)
+	}
 
 	var readyErr error
 	dbURL := firstNonEmpty(os.Getenv("SALE_DATABASE_URL"), cfg.DatabaseURL)
@@ -44,7 +49,7 @@ func main() {
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)
 	}
-	srv := httpx.NewServer(cfg.HTTPAddr, httpx.CorrelationMiddleware(mux))
+	srv := httpx.NewServer(cfg.HTTPAddr, httpx.WrapHandler(cfg.Name, authn.Middleware(mux)))
 	go func() {
 		log.Info("listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -7,4 +7,5 @@ use (
 	./services/order
 	./services/payment-simulator
 	./services/sale
+	./tools/devtoken
 )

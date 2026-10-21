@@ -62,14 +62,25 @@ services:
     ports:
       - "4317:4317"
       - "4318:4318"
+      - "8889:8889"
+    depends_on:
+      - tempo
 
   prometheus:
     profiles: ["obs"]
     image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
     volumes:
       - ./deployments/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployments/docker/prometheus/rules:/etc/prometheus/rules:ro
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - otel-collector
 
   grafana:
     profiles: ["obs"]
@@ -78,8 +89,15 @@ services:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./deployments/docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
 
   loki:
     profiles: ["obs"]
@@ -96,6 +114,10 @@ services:
       - ./deployments/docker/tempo/tempo.yaml:/etc/tempo.yaml:ro
     ports:
       - "3200:3200"
+    expose:
+      - "4317"
+      - "4318"
+
 
 volumes:
   postgres_data:

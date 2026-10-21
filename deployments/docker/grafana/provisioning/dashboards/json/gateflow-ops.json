@@ -1,0 +1,204 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Runbooks",
+      "url": "https://github.com/ghrushneshr25/gateflow/tree/main/docs/runbooks",
+      "type": "link"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Request rate by service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(gateflow_http_requests_total[1m]))",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Error ratio (5xx / total)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(gateflow_http_requests_total{status_class=\"5xx\"}[5m])) / clamp_min(sum by (service) (rate(gateflow_http_requests_total[5m])), 1e-9)",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Latency p50 / p95 / p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 5 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, service) (rate(gateflow_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{service}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(gateflow_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{service}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(gateflow_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 {{service}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Prometheus target health (gateflow-services)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "expr": "up{job=\"gateflow-services\"}",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Outbox unpublished + quarantine",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "gateflow_outbox_unpublished", "legendFormat": "unpublished", "refId": "A" },
+        { "expr": "gateflow_outbox_quarantined", "legendFormat": "quarantined", "refId": "B" }
+      ],
+      "description": "Runbook: docs/runbooks/outbox-quarantine-replay.md"
+    },
+    {
+      "title": "Outbox oldest age (s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "gateflow_outbox_oldest_age_seconds", "legendFormat": "oldest age", "refId": "A" }
+      ],
+      "description": "Alert when > 120s for 2m"
+    },
+    {
+      "title": "Reconciliation + payment pending",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "gateflow_order_reconciliation_required", "legendFormat": "recon required", "refId": "A" },
+        { "expr": "gateflow_order_payment_pending", "legendFormat": "payment pending", "refId": "B" }
+      ],
+      "description": "Runbook: docs/runbooks/reconciliation-backlog.md"
+    },
+    {
+      "title": "Admission fenced + epoch",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "gateflow_admission_coordination_fenced", "legendFormat": "fenced", "refId": "A" },
+        { "expr": "gateflow_admission_coordination_epoch", "legendFormat": "epoch", "refId": "B" }
+      ],
+      "description": "Runbook: docs/runbooks/admission-coordination-fence.md"
+    },
+    {
+      "title": "Grant outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(gateflow_admission_grants_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Payment outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(gateflow_payment_outcomes_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Payment success alone never confirms an order."
+    },
+    {
+      "title": "Compensation outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(gateflow_compensation_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Runbook: docs/runbooks/payment-ambiguity-compensation.md"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["gateflow", "ops"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "Gateflow Ops",
+  "uid": "gateflow-ops",
+  "version": 1
+}

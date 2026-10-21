@@ -29,4 +29,23 @@
 
 ## Operator scopes (initial)
 
-`ops:sale:write`, `ops:sale:publish`, `ops:admission:read`, `ops:inventory:read`, `ops:order:read`, `ops:order:recover`, `ops:payment:recover`, `ops:audit:read`
+`ops:sale:write`, `ops:sale:publish`, `ops:admission:read`, `ops:admission:fence`, `ops:admission:budget`, `ops:order:read`, `ops:order:recover`, `ops:outbox:read`, `ops:outbox:replay`, `ops:payment:recover`, `ops:audit:read`
+
+## Service scopes (P5.1.0)
+
+`inventory:write`, `admission:grant`, `admission:entitlement`, `payment:create`, `payment:callback`
+
+## Production secrets
+
+When `ENVIRONMENT` is not `local`/`dev`/`development`/`test`, `GATEFLOW_DEV_JWT_SECRET` must be set and must not equal the default development secret.
+
+## Endpoint matrix
+
+See `docs/security/endpoint-authorization-matrix.md`.
+
+## Buyer identity (P5.1.1)
+
+- Buyer JWT: `principal_type=buyer`, `sub` = canonical buyer ID, scope `buyer:self`.
+- Mint: `authn.MintBuyerJWT` / `go run ./tools/devtoken buyer buyer:self <buyer_id>`.
+- Product paths (checkout, own orders, queue join/me, own entitlement read) authorize from JWT only.
+- `X-Buyer-ID` is ignored for authorization on those paths (may appear in legacy clients but does not grant access).

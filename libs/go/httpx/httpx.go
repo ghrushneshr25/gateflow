@@ -5,7 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const HeaderCorrelationID = "X-Correlation-ID"
@@ -23,11 +24,12 @@ type ErrorDetail struct {
 	Details       map[string]any `json:"details,omitempty"`
 }
 
+// CorrelationID returns the request correlation id (after middleware) or normalizes header/generates.
 func CorrelationID(r *http.Request) string {
-	if id := r.Header.Get(HeaderCorrelationID); id != "" {
+	if id, ok := CorrelationFromContext(r.Context()); ok {
 		return id
 	}
-	return ids.ULID()
+	return NormalizeCorrelationID(r.Header.Get(HeaderCorrelationID))
 }
 
 func WriteJSON(w http.ResponseWriter, status int, v any) {
@@ -46,14 +48,61 @@ func WriteError(w http.ResponseWriter, httpStatus int, code, message, correlatio
 	}})
 }
 
+// CorrelationMiddleware validates/generates X-Correlation-ID, stores it in context,
+// and echoes it on the response. Invalid incoming values are replaced (not trusted).
 func CorrelationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := CorrelationID(r)
+		id := NormalizeCorrelationID(r.Header.Get(HeaderCorrelationID))
 		w.Header().Set(HeaderCorrelationID, id)
+		ctx := WithCorrelation(r.Context(), id)
+		r = r.WithContext(ctx)
 		r.Header.Set(HeaderCorrelationID, id)
 		next.ServeHTTP(w, r)
 	})
 }
+
+// WrapHandler applies metrics RED, OTel HTTP server instrumentation, and correlation.
+// Order: otelhttp → metrics → correlation → app
+func WrapHandler(service string, h http.Handler) http.Handler {
+	inner := CorrelationMiddleware(h)
+	inner = metrics.Middleware(service, inner)
+	return otelhttp.NewHandler(inner, service,
+		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}),
+	)
+}
+
+// InstrumentedTransport returns an HTTP RoundTripper that propagates W3C trace context
+// and X-Correlation-ID from the request context.
+func InstrumentedTransport(base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	otelRT := otelhttp.NewTransport(base)
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if id, ok := CorrelationFromContext(r.Context()); ok && r.Header.Get(HeaderCorrelationID) == "" {
+			r = r.Clone(r.Context())
+			r.Header.Set(HeaderCorrelationID, id)
+		}
+		return otelRT.RoundTrip(r)
+	})
+}
+
+// NewClient returns an http.Client with trace + correlation propagation.
+func NewClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: InstrumentedTransport(http.DefaultTransport),
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 type Health struct {
 	Service string `json:"service"`
@@ -62,6 +111,7 @@ type Health struct {
 }
 
 func MountHealth(mux *http.ServeMux, service string, ready func() error) {
+	metrics.Mount(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusOK, Health{
 			Service: service,

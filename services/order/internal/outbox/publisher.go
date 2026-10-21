@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ghrushneshrathod/gateflow/libs/go/kafkax"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/libs/go/testhooks"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/store"
 )
@@ -107,6 +108,7 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 	if err := json.Unmarshal(row.Payload, &payload); err != nil {
 		_ = p.Store.FailOutboxClaim(ctx, row.ID, "invalid payload json: "+err.Error())
 		p.Metrics.PublishFail.Add(1)
+		metrics.OutboxPublish("fail")
 		return err
 	}
 	env := map[string]any{
@@ -122,6 +124,7 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 	if err != nil {
 		_ = p.Store.FailOutboxClaim(ctx, row.ID, err.Error())
 		p.Metrics.PublishFail.Add(1)
+		metrics.OutboxPublish("fail")
 		return err
 	}
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -133,6 +136,7 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 	if err != nil {
 		_ = p.Store.FailOutboxClaim(ctx, row.ID, err.Error())
 		p.Metrics.PublishFail.Add(1)
+		metrics.OutboxPublish("fail")
 		return err
 	}
 	// P4.5: Kafka accepted write; PG published_at not yet set.
@@ -140,10 +144,12 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 	if err := p.Store.MarkOutboxPublished(ctx, row.ID, time.Now().UTC()); err != nil {
 		// Kafka already has the message; stable event_id + consumer dedupe handles republish.
 		p.Metrics.PublishFail.Add(1)
+		metrics.OutboxPublish("fail")
 		p.Log.Error("mark published failed after kafka ack", "event_id", row.EventID, "err", err)
 		return err
 	}
 	p.Metrics.PublishOK.Add(1)
+	metrics.OutboxPublish("ok")
 	return nil
 }
 

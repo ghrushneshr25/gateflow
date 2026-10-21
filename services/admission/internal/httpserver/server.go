@@ -12,6 +12,7 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/ids"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/services/admission/internal/store"
 )
 
@@ -53,46 +54,44 @@ func (s *Server) Routes(mux *http.ServeMux) {
 }
 
 func (s *Server) requireOps(w http.ResponseWriter, r *http.Request, corr, scope string) (authn.Claims, bool) {
-	c, ok := authn.ClaimsFromContext(r.Context())
-	if !ok || (c.PrincipalType != "operator" && c.PrincipalType != "service") {
-		httpx.WriteError(w, 401, "ADM_UNAUTHORIZED", "valid operator/service bearer token required", corr, "failed", false)
-		return c, false
+	scopes := []string{scope}
+	if scope == authn.ScopeAdmissionRead {
+		scopes = []string{authn.ScopeAdmissionRead, authn.ScopeAdmissionFence, authn.ScopeAdmissionBudget}
 	}
-	allowed := authn.HasScope(c, "*") || authn.HasScope(c, scope)
-	if scope == "ops:admission:read" {
-		allowed = allowed || authn.HasScope(c, "ops:admission:read") || authn.HasScope(c, "ops:admission:fence")
-	}
-	if scope == "ops:admission:fence" {
-		allowed = allowed || authn.HasScope(c, "ops:admission:fence")
-	}
-	if !allowed {
-		httpx.WriteError(w, 403, "ADM_FORBIDDEN", "insufficient scope", corr, "failed", false)
+	c, err := authn.RequireOperatorOrService(r, scopes...)
+	if err != nil {
+		code := "ADM_UNAUTHORIZED"
+		if errors.Is(err, authn.ErrForbidden) {
+			code = "ADM_FORBIDDEN"
+		}
+		httpx.WriteError(w, authn.StatusCode(err), code, err.Error(), corr, "failed", false)
 		return c, false
 	}
 	return c, true
 }
 
-func buyerFrom(r *http.Request) string {
-	if b := r.Header.Get("X-Buyer-ID"); b != "" {
-		return b
+func (s *Server) requireService(w http.ResponseWriter, r *http.Request, corr string, scopes ...string) bool {
+	_, err := authn.RequireService(r, scopes...)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return false
 	}
-	return r.URL.Query().Get("buyer_id")
+	return true
 }
 
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
-	buyer := buyerFrom(r)
-	if buyer == "" {
-		var body struct {
-			BuyerID string `json:"buyer_id"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		buyer = body.BuyerID
-	}
-	if buyer == "" {
-		httpx.WriteError(w, 401, "ADM_UNAUTHORIZED", "buyer_id required", corr, "failed", false)
+	bc, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", "buyer JWT required", corr, "failed", false)
 		return
 	}
+	buyer := authn.BuyerID(bc)
+	// Drain body if present (buyer_id in body is ignored).
+	var body struct {
+		BuyerID string `json:"buyer_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
 	entry, err := s.Store.Join(r.Context(), store.QueueEntry{
 		ID: ids.New("q"), SessionID: r.PathValue("session_id"), BuyerID: buyer, CreatedAt: time.Now().UTC(),
 	})
@@ -105,11 +104,12 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
-	buyer := buyerFrom(r)
-	if buyer == "" {
-		httpx.WriteError(w, 401, "ADM_UNAUTHORIZED", "buyer_id required", corr, "failed", false)
+	bc, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", "buyer JWT required", corr, "failed", false)
 		return
 	}
+	buyer := authn.BuyerID(bc)
 	entry, err := s.Store.GetMine(r.Context(), r.PathValue("session_id"), buyer)
 	if errors.Is(err, store.ErrNotFound) {
 		httpx.WriteError(w, 404, "ADM_NOT_FOUND", "not in queue", corr, "failed", false)
@@ -128,37 +128,56 @@ func (s *Server) grant(w http.ResponseWriter, r *http.Request) {
 		BuyerID string `json:"buyer_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.BuyerID == "" {
-		req.BuyerID = buyerFrom(r)
-	}
-	if req.BuyerID == "" {
-		httpx.WriteError(w, 400, "ADM_VALIDATION_FAILED", "buyer_id required", corr, "failed", false)
+
+	// Authorize, then always use the same GrantFIFO store path (no alternate entitlement write).
+	var buyerID string
+	if _, err := authn.RequireService(r, authn.ScopeAdmissionGrant); err == nil {
+		// Authorized service may grant for an explicit target buyer.
+		buyerID = req.BuyerID
+		if buyerID == "" {
+			httpx.WriteError(w, 400, "ADM_VALIDATION_FAILED", "buyer_id required", corr, "failed", false)
+			return
+		}
+	} else if bc, berr := authn.RequireBuyer(r); berr == nil {
+		// Buyer self-grant only: verified JWT sub. Body/header buyer_id is ignored.
+		buyerID = authn.BuyerID(bc)
+	} else {
+		// Prefer the first auth error (service path) when both fail — typically missing/invalid token.
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", "service (admission:grant) or buyer JWT required", corr, "failed", false)
 		return
 	}
+
 	sessionID := r.PathValue("session_id")
 	_ = s.Store.EnsureBudgets(r.Context(), sessionID, 10000, 1000)
-	entry, ent, err := s.Store.GrantFIFO(r.Context(), sessionID, req.BuyerID, ids.New("ent"), 10*time.Minute, time.Now().UTC())
+	// Authoritative grant: queue row lock, fence, budget consume, entitlement insert, idempotent re-read.
+	entry, ent, err := s.Store.GrantFIFO(r.Context(), sessionID, buyerID, ids.New("ent"), 10*time.Minute, time.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
+		metrics.AdmissionGrant("not_found")
 		httpx.WriteError(w, 404, "ADM_NOT_FOUND", "queue entry not found", corr, "failed", false)
 		return
 	}
 	if errors.Is(err, store.ErrBudgetExhausted) {
+		metrics.AdmissionGrant("budget")
 		httpx.WriteError(w, 429, "ADM_BUDGET_EXHAUSTED", "admission grant budget exhausted", corr, "failed", true)
 		return
 	}
 	if errors.Is(err, store.ErrCoordinationFenced) {
 		s.FencedGrantTotal.Add(1)
+		metrics.AdmissionGrant("fenced")
 		httpx.WriteError(w, 503, "ADM_COORDINATION_FENCED", "new grants are fenced", corr, "failed", true)
 		return
 	}
 	if errors.Is(err, store.ErrCoordinationUnavailable) {
+		metrics.AdmissionGrant("error")
 		httpx.WriteError(w, 503, "ADM_COORDINATION_UNAVAILABLE", "coordination state unavailable", corr, "failed", true)
 		return
 	}
 	if err != nil {
+		metrics.AdmissionGrant("error")
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	metrics.AdmissionGrant("ok")
 	httpx.WriteJSON(w, 200, map[string]any{"queue_entry": entry, "entitlement": ent})
 }
 
@@ -176,6 +195,7 @@ func (s *Server) getCoordination(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	metrics.SetAdmissionFenced(c.Mode == store.CoordModeFenced, float64(c.Epoch))
 	httpx.WriteJSON(w, 200, c)
 }
 
@@ -194,6 +214,7 @@ func (s *Server) fence(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	metrics.SetAdmissionFenced(c.Mode == store.CoordModeFenced, float64(c.Epoch))
 	httpx.WriteJSON(w, 200, c)
 }
 
@@ -208,6 +229,7 @@ func (s *Server) unfence(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	metrics.SetAdmissionFenced(c.Mode == store.CoordModeFenced, float64(c.Epoch))
 	httpx.WriteJSON(w, 200, c)
 }
 
@@ -241,11 +263,28 @@ func (s *Server) getEnt(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
+	// Service may read any entitlement; buyer only own.
+	if _, err := authn.RequireService(r, authn.ScopeAdmissionEntitlement, authn.ScopeAdmissionGrant); err == nil {
+		httpx.WriteJSON(w, 200, ent)
+		return
+	}
+	bc, err := authn.RequireBuyer(r)
+	if err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", "buyer or service JWT required", corr, "failed", false)
+		return
+	}
+	if ent.BuyerID != authn.BuyerID(bc) {
+		httpx.WriteError(w, 403, "ADM_FORBIDDEN", "not owner", corr, "failed", false)
+		return
+	}
 	httpx.WriteJSON(w, 200, ent)
 }
 
 func (s *Server) bind(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr, authn.ScopeAdmissionEntitlement) {
+		return
+	}
 	var req struct {
 		BuyerID             string `json:"buyer_id"`
 		CheckoutOperationID string `json:"checkout_operation_id"`
@@ -280,6 +319,10 @@ func (s *Server) bind(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getBudget(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if _, err := authn.RequireOperatorOrService(r, authn.ScopeAdmissionBudget, authn.ScopeAdmissionRead, authn.ScopeAdmissionFence); err != nil {
+		httpx.WriteError(w, authn.StatusCode(err), "ADM_UNAUTHORIZED", err.Error(), corr, "failed", false)
+		return
+	}
 	scope := r.PathValue("scope")
 	if scope != "global" && !strings.HasPrefix(scope, "session:") {
 		scope = "session:" + scope
@@ -298,6 +341,9 @@ func (s *Server) getBudget(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) putBudget(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if _, ok := s.requireOps(w, r, corr, authn.ScopeAdmissionBudget); !ok {
+		return
+	}
 	scope := r.PathValue("scope")
 	if scope != "global" {
 		scope = "session:" + strings.TrimPrefix(scope, "session:")
@@ -325,6 +371,9 @@ func (s *Server) putBudget(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) consume(w http.ResponseWriter, r *http.Request) {
 	corr := httpx.CorrelationID(r)
+	if !s.requireService(w, r, corr, authn.ScopeAdmissionEntitlement) {
+		return
+	}
 	var req struct {
 		CheckoutOperationID string `json:"checkout_operation_id"`
 	}

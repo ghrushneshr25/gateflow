@@ -22,6 +22,10 @@ func main() {
 	cfg := config.LoadService("payment-simulator", ":8085")
 	log := logging.New(cfg.Name, cfg.LogLevel)
 	defer telemetry.Init(log, cfg.Name)()
+	if err := authn.MustValidateProductionSecret(); err != nil {
+		log.Error("auth config", "err", err)
+		os.Exit(1)
+	}
 
 	var readyErr error
 	dbURL := firstNonEmpty(os.Getenv("PAYMENT_DATABASE_URL"), cfg.DatabaseURL)
@@ -45,7 +49,7 @@ func main() {
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)
 	}
-	handler := authn.Middleware(httpx.CorrelationMiddleware(mux))
+	handler := httpx.WrapHandler(cfg.Name, authn.Middleware(mux))
 	srv := httpx.NewServer(cfg.HTTPAddr, handler)
 	go func() {
 		log.Info("listening", "addr", cfg.HTTPAddr)

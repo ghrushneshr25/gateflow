@@ -16,14 +16,12 @@ func TestAdminReconciliationRejectsSpoofedHeaders(t *testing.T) {
 	s := httpserver.NewWithDeps(ms, mockHTTP{}, httpserver.Deps{})
 	mux := http.NewServeMux()
 	s.Routes(mux)
-	// Wrap without authn middleware — claims absent; spoofed headers must fail
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/reconciliation", nil)
 	req.Header.Set("X-Ops-Role", "admin")
-	req.Header.Set("X-Service-Name", "evil")
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != 401 {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		t.Fatalf("status=%d", rr.Code)
 	}
 }
 
@@ -33,12 +31,7 @@ func TestAdminReconciliationAcceptsOperatorJWT(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Routes(mux)
 	handler := authn.Middleware(mux)
-
-	signer := authn.NewDevSigner("gateflow-dev-secret-change-me")
-	tok, err := signer.Sign(authn.Claims{
-		Subject: "ops1", PrincipalType: "operator",
-		Scopes: []string{"ops:order:recover"},
-	}, time.Hour)
+	tok, err := authn.MintOperatorJWT(authn.DefaultDevSecret, "ops1", []string{authn.ScopeOrderRecover}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,5 +41,47 @@ func TestAdminReconciliationAcceptsOperatorJWT(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetOrderBuyerJWTOwnership(t *testing.T) {
+	ms := &mockStore{
+		byID: map[string]store.Order{
+			"ord_1": {ID: "ord_1", BuyerID: "buyer_a", Status: "CONFIRMED"},
+		},
+	}
+	s := httpserver.NewWithDeps(ms, mockHTTP{}, httpserver.Deps{})
+	mux := http.NewServeMux()
+	s.Routes(mux)
+	h := authn.Middleware(mux)
+
+	// header only — rejected
+	req := httptest.NewRequest(http.MethodGet, "/v1/orders/ord_1", nil)
+	req.Header.Set("X-Buyer-ID", "buyer_a")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 401 {
+		t.Fatalf("header only %d", rr.Code)
+	}
+
+	// wrong buyer JWT
+	tokB, _ := authn.MintBuyerJWT(authn.DefaultDevSecret, "buyer_b", nil, time.Hour)
+	req = httptest.NewRequest(http.MethodGet, "/v1/orders/ord_1", nil)
+	req.Header.Set("Authorization", "Bearer "+tokB)
+	req.Header.Set("X-Buyer-ID", "buyer_a") // spoof ignored
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 403 {
+		t.Fatalf("cross buyer %d %s", rr.Code, rr.Body.String())
+	}
+
+	// owner JWT
+	tokA, _ := authn.MintBuyerJWT(authn.DefaultDevSecret, "buyer_a", nil, time.Hour)
+	req = httptest.NewRequest(http.MethodGet, "/v1/orders/ord_1", nil)
+	req.Header.Set("Authorization", "Bearer "+tokA)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("owner %d %s", rr.Code, rr.Body.String())
 	}
 }

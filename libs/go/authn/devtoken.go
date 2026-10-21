@@ -28,7 +28,7 @@ type DevSigner struct {
 
 func NewDevSigner(secret string) *DevSigner {
 	if secret == "" {
-		secret = "gateflow-dev-secret-change-me"
+		secret = DefaultDevSecret
 	}
 	return &DevSigner{Secret: []byte(secret), Issuer: "gateflow-dev"}
 }

@@ -6,7 +6,9 @@ distributor:
     otlp:
       protocols:
         grpc:
+          endpoint: 0.0.0.0:4317
         http:
+          endpoint: 0.0.0.0:4318
 
 storage:
   trace:
@@ -15,3 +17,12 @@ storage:
       path: /tmp/tempo/blocks
     wal:
       path: /tmp/tempo/wal
+
+querier:
+  frontend_worker:
+    frontend_address: ""
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: []

@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ghrushneshr25/nexus"
+	"github.com/ghrushneshrathod/gateflow/libs/go/authn"
 	"github.com/ghrushneshrathod/gateflow/libs/go/appnexus"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/app"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/httpserver"
@@ -37,12 +39,17 @@ func TestHTTPIdempotencyConflict(t *testing.T) {
 		"pool_id": "pool", "entitlement_id": "ent", "quantity": 2,
 		"amount_cents": 100, "idempotency_key": "key-1",
 	})
+	tok, err := authn.MintBuyerJWT(authn.DefaultDevSecret, "buyer_1", nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := authn.Middleware(mux)
 	req := httptest.NewRequest(http.MethodPost, "/v1/checkouts", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Buyer-ID", "buyer_1")
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Idempotency-Key", "key-1")
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
+	handler.ServeHTTP(rr, req)
 	if rr.Code != 409 {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}

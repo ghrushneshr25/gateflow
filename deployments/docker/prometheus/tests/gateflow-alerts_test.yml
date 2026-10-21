@@ -1,0 +1,60 @@
+# promtool test rules gateflow-alerts_test.yml
+rule_files:
+  - ../rules/gateflow-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'gateflow_outbox_oldest_age_seconds'
+        values: '0 0 150 150 150'
+      - series: 'gateflow_outbox_quarantined'
+        values: '0 0 0 2 2'
+      - series: 'gateflow_order_reconciliation_required'
+        values: '0 0 0 0 10 10 10 10 10 10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GateflowOutboxOldestAgeHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Outbox oldest unpublished event age high"
+              description: "Oldest unpublished outbox row is 2m 30s old (threshold 2m). Check Kafka connectivity and publisher health."
+              runbook: "docs/runbooks/outbox-quarantine-replay.md"
+      - eval_time: 5m
+        alertname: GateflowOutboxQuarantineNonZero
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Outbox quarantine count > 0"
+              description: "2 outbox row(s) quarantined. Inspect /v1/admin/outbox/quarantined and replay or fix payload."
+              runbook: "docs/runbooks/outbox-quarantine-replay.md"
+      - eval_time: 10m
+        alertname: GateflowReconciliationBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Order reconciliation backlog high"
+              description: "10 orders in RECONCILIATION_REQUIRED (threshold 5 for 5m). Run operator recover / advance."
+              runbook: "docs/runbooks/reconciliation-backlog.md"
+  - interval: 1m
+    input_series:
+      - series: 'gateflow_outbox_quarantined'
+        values: '2 2 2 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GateflowOutboxQuarantineNonZero
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Outbox quarantine count > 0"
+              description: "2 outbox row(s) quarantined. Inspect /v1/admin/outbox/quarantined and replay or fix payload."
+              runbook: "docs/runbooks/outbox-quarantine-replay.md"
+      - eval_time: 5m
+        alertname: GateflowOutboxQuarantineNonZero
+        exp_alerts: []

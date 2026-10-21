@@ -15,6 +15,7 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/kafkax"
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/libs/go/telemetry"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/app"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/outbox"
@@ -25,6 +26,10 @@ func main() {
 	cfg := config.LoadService("order", ":8084")
 	log := logging.New(cfg.Name, cfg.LogLevel)
 	defer telemetry.Init(log, cfg.Name)()
+	if err := authn.MustValidateProductionSecret(); err != nil {
+		log.Error("auth config", "err", err)
+		os.Exit(1)
+	}
 
 	var readyErr error
 	var st *store.Store
@@ -60,6 +65,21 @@ func main() {
 		log.Info("kafka outbox runtime supervising reconnect", "brokers", brokers)
 	} else {
 		log.Info("kafka outbox disabled or no store")
+	}
+	// Low-frequency ops gauges (avoid tight DB loops).
+	if st != nil {
+		go func() {
+			t := time.NewTicker(15 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-bgCtx.Done():
+					return
+				case <-t.C:
+					refreshOrderGauges(bgCtx, st)
+				}
+			}
+		}()
 	}
 
 	mux := http.NewServeMux()
@@ -153,7 +173,7 @@ func main() {
 		nexus.MustGet(app.APIServerContract).Routes(mux)
 	}
 
-	handler := authn.Middleware(httpx.CorrelationMiddleware(mux))
+	handler := httpx.WrapHandler(cfg.Name, authn.Middleware(mux))
 	srv := httpx.NewServer(cfg.HTTPAddr, handler)
 	go func() {
 		log.Info("listening", "addr", cfg.HTTPAddr)
@@ -169,6 +189,20 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(sh)
 	slog.Info("stopped")
+}
+
+func refreshOrderGauges(ctx context.Context, st *store.Store) {
+	age, n, err := st.OutboxBacklog(ctx)
+	q := 0
+	if qn, qerr := st.CountQuarantined(ctx); qerr == nil {
+		q = qn
+	}
+	if err == nil {
+		metrics.SetOutbox(float64(n), float64(q), age.Seconds())
+	}
+	recon, _ := st.ListByStatus(ctx, "RECONCILIATION_REQUIRED", 500)
+	pending, _ := st.ListByStatus(ctx, "PAYMENT_PENDING", 500)
+	metrics.SetOrderBacklog(float64(len(recon)), float64(len(pending)))
 }
 
 func requireOutboxRead(w http.ResponseWriter, r *http.Request) bool {
