@@ -1,6 +1,6 @@
 module github.com/ghrushneshrathod/gateflow/libs/go
 
-go 1.25.0
+go 1.27.0
 
 require (
 	github.com/ghrushneshr25/nexus v1.2.0

@@ -30,7 +30,7 @@ func TestMiddlewareIncrementsCounter(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatal(rr.Code)
 	}
-	AdmissionGrant("ok")
+	AdmissionGrant("ok", "A")
 	SetAdmissionFenced(true, 3)
 	SetOrderBacklog(2, 1)
 	SetOutbox(5, 1, 12.5)

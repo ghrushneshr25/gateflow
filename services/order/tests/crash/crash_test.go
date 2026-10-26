@@ -560,12 +560,21 @@ func TestCrashC_PublisherAfterKafkaAck(t *testing.T) {
 		t.Fatal("expected unpublished after ack-before-mark crash")
 	}
 
-	// Recover: mark published + consume with isolated group (avoid stale offsets).
+	// Recover publisher+consumer. Use a fresh consumer group at *latest* so recovery
+	// is not blocked draining historical load-test traffic on the shared topic
+	// (FirstOffset + polluted topic → timeout before this order's effect appears).
+	// Publisher will republish the still-unpublished outbox row; consumer at latest
+	// observes that republish (at-least-once; same stable event_id).
 	if err := s.order.Restart([]string{
 		"GATEFLOW_KAFKA_GROUP=crash-c-" + oid,
+		"GATEFLOW_KAFKA_START=latest",
+		"GATEFLOW_CRASH_BOUNDARY=", // clear crash hook on recovery
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Brief settle so the consumer group joins at latest before republish races.
+	time.Sleep(500 * time.Millisecond)
+
 	pubDeadline := time.Now().Add(20 * time.Second)
 	var published bool
 	for time.Now().Before(pubDeadline) {
@@ -578,7 +587,7 @@ func TestCrashC_PublisherAfterKafkaAck(t *testing.T) {
 	if !published {
 		t.Fatalf("not published after recovery log=%s", fmtLog(s.order))
 	}
-	effDeadline := time.Now().Add(30 * time.Second)
+	effDeadline := time.Now().Add(45 * time.Second)
 	var n int
 	for time.Now().Before(effDeadline) {
 		n, _ = st.CountConfirmedEffects(context.Background(), oid)
@@ -588,7 +597,7 @@ func TestCrashC_PublisherAfterKafkaAck(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	if n != 1 {
-		t.Fatalf("effects want 1 got %d log=%s", n, fmtLog(s.order))
+		t.Fatalf("effects want 1 got %d order=%s event=%s log=%s", n, oid, eventID, fmtLog(s.order))
 	}
 }
 

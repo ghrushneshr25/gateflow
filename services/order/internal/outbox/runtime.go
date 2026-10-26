@@ -130,10 +130,14 @@ func (r *Runtime) startWorkersOnce(parent context.Context) {
 		// Crash-recovery tests need fast reclaim after process death mid-publish.
 		lease = 2 * time.Second
 	}
+	// P6.1: slightly more aggressive drain defaults after P6.0 observed multi-thousand
+	// unpublished backlog under burst confirms. Semantics unchanged (claim/lease/dedupe).
 	r.Pub = &Publisher{
 		Store: r.Store, Producer: r.prod, WorkerID: ids.New("order-pub"),
-		Log: r.Log, Metrics: r.Metrics, Topic: r.Topic, Interval: 300 * time.Millisecond,
-		Lease: lease,
+		Log: r.Log, Metrics: r.Metrics, Topic: r.Topic,
+		Interval: 100 * time.Millisecond,
+		Batch:    50,
+		Lease:    lease,
 	}
 	r.Cons = &Consumer{Store: r.Store, Reader: r.reader, Log: r.Log}
 

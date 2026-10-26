@@ -25,6 +25,9 @@ func (m *mockCoordStore) GetMine(context.Context, string, string) (store.QueueEn
 func (m *mockCoordStore) GrantFIFO(context.Context, string, string, string, time.Duration, time.Time) (store.QueueEntry, store.Entitlement, error) {
 	return store.QueueEntry{}, store.Entitlement{}, store.ErrCoordinationFenced
 }
+func (m *mockCoordStore) GrantFIFOProtocolB(context.Context, string, string, string, time.Duration, time.Time) (store.QueueEntry, store.Entitlement, error) {
+	return store.QueueEntry{}, store.Entitlement{}, store.ErrCoordinationFenced
+}
 func (m *mockCoordStore) GetEntitlement(context.Context, string) (store.Entitlement, error) {
 	return store.Entitlement{}, store.ErrNotFound
 }

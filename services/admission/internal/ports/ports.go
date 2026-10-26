@@ -12,6 +12,7 @@ type AdmissionStore interface {
 	Join(ctx context.Context, entry store.QueueEntry) (store.QueueEntry, error)
 	GetMine(ctx context.Context, sessionID, buyerID string) (store.QueueEntry, error)
 	GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error)
+	GrantFIFOProtocolB(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error)
 	GetEntitlement(ctx context.Context, id string) (store.Entitlement, error)
 	Bind(ctx context.Context, id, buyerID, checkoutOp string, now time.Time) (store.Entitlement, error)
 	Consume(ctx context.Context, id, checkoutOp string, now time.Time) (store.Entitlement, error)

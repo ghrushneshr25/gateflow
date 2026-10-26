@@ -13,8 +13,9 @@ import (
 )
 
 type RuntimeConfig struct {
-	DatabaseURL string
-	SearchPath  string
+	DatabaseURL   string
+	SearchPath    string
+	GrantProtocol string // "A" or "B"; empty → A
 }
 
 func AdmissionStoreContract() nexus.Contract[ports.AdmissionStore] {
@@ -36,7 +37,9 @@ func Wire(rt RuntimeConfig) (*pgxpool.Pool, error) {
 	}
 	nexus.MustDeclareValue(pool)
 	nexus.MustDeclare(func(p *pgxpool.Pool) ports.AdmissionStore { return store.New(p) })
-	nexus.MustDeclare(func(st ports.AdmissionStore) ports.APIServer { return httpserver.New(st) })
+	nexus.MustDeclare(func(st ports.AdmissionStore, cfg RuntimeConfig) ports.APIServer {
+		return httpserver.NewWithProtocol(st, cfg.GrantProtocol)
+	})
 	if err := nexus.Validate(); err != nil {
 		pool.Close()
 		return nil, err

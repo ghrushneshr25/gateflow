@@ -14,8 +14,10 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/config"
 	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/ghrushneshrathod/gateflow/libs/go/telemetry"
 	"github.com/ghrushneshrathod/gateflow/services/admission/internal/app"
+	"github.com/ghrushneshrathod/gateflow/services/admission/internal/grantprotocol"
 )
 
 func main() {
@@ -27,12 +29,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	grantProto := grantprotocol.FromEnv()
+	rawProto := os.Getenv(grantprotocol.EnvVar)
+	if rawProto != "" && !grantprotocol.IsValid(rawProto) {
+		log.Warn("invalid grant protocol; defaulting to A", "env", grantprotocol.EnvVar, "value", rawProto)
+	}
+	metrics.SetAdmissionGrantProtocol(grantProto)
+	log.Info("admission grant protocol selected", "protocol", grantProto, "env", grantprotocol.EnvVar)
+
 	var readyErr error
 	dbURL := firstNonEmpty(os.Getenv("ADMISSION_DATABASE_URL"), cfg.DatabaseURL)
 	if dbURL == "" {
 		readyErr = errNoDB
 	} else {
-		pool, err := app.Wire(app.RuntimeConfig{DatabaseURL: dbURL, SearchPath: "admission"})
+		pool, err := app.Wire(app.RuntimeConfig{
+			DatabaseURL: dbURL, SearchPath: "admission", GrantProtocol: grantProto,
+		})
 		if err != nil {
 			readyErr = err
 			log.Error("wire", "err", err)
@@ -44,7 +56,10 @@ func main() {
 	mux := http.NewServeMux()
 	httpx.MountHealth(mux, cfg.Name, func() error { return readyErr })
 	mux.HandleFunc("GET /v1/meta", func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, 200, map[string]any{"service": cfg.Name, "phase": 4, "di": "nexus", "coordination": "pg-fence"})
+		httpx.WriteJSON(w, 200, map[string]any{
+			"service": cfg.Name, "phase": 6, "di": "nexus", "coordination": "pg-fence",
+			"grant_protocol": grantProto,
+		})
 	})
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)

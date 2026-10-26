@@ -20,6 +20,8 @@ type AdmissionStore interface {
 	Join(ctx context.Context, entry store.QueueEntry) (store.QueueEntry, error)
 	GetMine(ctx context.Context, sessionID, buyerID string) (store.QueueEntry, error)
 	GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error)
+	// GrantFIFOProtocolB is experimental generation-bound path (P6.6 flag B only).
+	GrantFIFOProtocolB(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error)
 	GetEntitlement(ctx context.Context, id string) (store.Entitlement, error)
 	Bind(ctx context.Context, id, buyerID, checkoutOp string, now time.Time) (store.Entitlement, error)
 	Consume(ctx context.Context, id, checkoutOp string, now time.Time) (store.Entitlement, error)
@@ -34,9 +36,20 @@ type AdmissionStore interface {
 type Server struct {
 	Store            AdmissionStore
 	FencedGrantTotal atomic.Int64
+	// GrantProtocol is "A" or "B", set once at process start (default A).
+	GrantProtocol string
 }
 
-func New(st AdmissionStore) *Server { return &Server{Store: st} }
+func New(st AdmissionStore) *Server { return &Server{Store: st, GrantProtocol: "A"} }
+
+// NewWithProtocol sets grant protocol A|B (invalid → A).
+func NewWithProtocol(st AdmissionStore, protocol string) *Server {
+	p := strings.ToUpper(strings.TrimSpace(protocol))
+	if p != "B" {
+		p = "A"
+	}
+	return &Server{Store: st, GrantProtocol: p}
+}
 
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions/{session_id}/queue/joins", s.join)
@@ -92,8 +105,11 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 		BuyerID string `json:"buyer_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	sessionID := r.PathValue("session_id")
+	// P6.7: create session budget before grant hot path so GrantFIFO rarely inserts under coord lock.
+	_ = s.Store.EnsureBudgets(r.Context(), sessionID, 10000, 1000)
 	entry, err := s.Store.Join(r.Context(), store.QueueEntry{
-		ID: ids.New("q"), SessionID: r.PathValue("session_id"), BuyerID: buyer, CreatedAt: time.Now().UTC(),
+		ID: ids.New("q"), SessionID: sessionID, BuyerID: buyer, CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
@@ -149,36 +165,60 @@ func (s *Server) grant(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := r.PathValue("session_id")
 	_ = s.Store.EnsureBudgets(r.Context(), sessionID, 10000, 1000)
-	// Authoritative grant: queue row lock, fence, budget consume, entitlement insert, idempotent re-read.
-	entry, ent, err := s.Store.GrantFIFO(r.Context(), sessionID, buyerID, ids.New("ent"), 10*time.Minute, time.Now().UTC())
+	proto := s.effectiveProtocol()
+	// Auth already enforced above. Both buyer self-grant and service grant use the same selector.
+	entry, ent, err := s.runGrant(r.Context(), sessionID, buyerID)
 	if errors.Is(err, store.ErrNotFound) {
-		metrics.AdmissionGrant("not_found")
+		metrics.AdmissionGrant("not_found", proto)
 		httpx.WriteError(w, 404, "ADM_NOT_FOUND", "queue entry not found", corr, "failed", false)
 		return
 	}
 	if errors.Is(err, store.ErrBudgetExhausted) {
-		metrics.AdmissionGrant("budget")
+		metrics.AdmissionGrant("budget", proto)
 		httpx.WriteError(w, 429, "ADM_BUDGET_EXHAUSTED", "admission grant budget exhausted", corr, "failed", true)
 		return
 	}
 	if errors.Is(err, store.ErrCoordinationFenced) {
 		s.FencedGrantTotal.Add(1)
-		metrics.AdmissionGrant("fenced")
+		metrics.AdmissionGrant("fenced", proto)
 		httpx.WriteError(w, 503, "ADM_COORDINATION_FENCED", "new grants are fenced", corr, "failed", true)
 		return
 	}
+	if errors.Is(err, store.ErrStaleGeneration) {
+		metrics.AdmissionGrant("stale", proto)
+		httpx.WriteError(w, 503, "ADM_STALE_GENERATION", "grant generation invalidated by fence", corr, "failed", true)
+		return
+	}
 	if errors.Is(err, store.ErrCoordinationUnavailable) {
-		metrics.AdmissionGrant("error")
+		metrics.AdmissionGrant("error", proto)
 		httpx.WriteError(w, 503, "ADM_COORDINATION_UNAVAILABLE", "coordination state unavailable", corr, "failed", true)
 		return
 	}
 	if err != nil {
-		metrics.AdmissionGrant("error")
+		metrics.AdmissionGrant("error", proto)
 		httpx.WriteError(w, 500, "ADM_INTERNAL", err.Error(), corr, "failed", true)
 		return
 	}
-	metrics.AdmissionGrant("ok")
+	metrics.AdmissionGrant("ok", proto)
 	httpx.WriteJSON(w, 200, map[string]any{"queue_entry": entry, "entitlement": ent})
+}
+
+func (s *Server) effectiveProtocol() string {
+	if s != nil && s.GrantProtocol == "B" {
+		return "B"
+	}
+	return "A"
+}
+
+// runGrant selects Protocol A or B after authorization (P6.6).
+func (s *Server) runGrant(ctx context.Context, sessionID, buyerID string) (store.QueueEntry, store.Entitlement, error) {
+	entID := ids.New("ent")
+	now := time.Now().UTC()
+	ttl := 10 * time.Minute
+	if s.effectiveProtocol() == "B" {
+		return s.Store.GrantFIFOProtocolB(ctx, sessionID, buyerID, entID, ttl, now)
+	}
+	return s.Store.GrantFIFO(ctx, sessionID, buyerID, entID, ttl, now)
 }
 
 func (s *Server) getCoordination(w http.ResponseWriter, r *http.Request) {

@@ -17,12 +17,13 @@ import (
 
 // grantSpyStore records GrantFIFO calls and returns configurable results.
 type grantSpyStore struct {
-	mu       sync.Mutex
-	calls    []grantCall
-	entry    store.QueueEntry
-	ent      store.Entitlement
-	err      error
+	mu        sync.Mutex
+	calls     []grantCall
+	entry     store.QueueEntry
+	ent       store.Entitlement
+	err       error
 	callCount int
+	lastPath  string // "A" or "B"
 }
 
 type grantCall struct {
@@ -35,7 +36,7 @@ func (g *grantSpyStore) Join(context.Context, store.QueueEntry) (store.QueueEntr
 func (g *grantSpyStore) GetMine(context.Context, string, string) (store.QueueEntry, error) {
 	return store.QueueEntry{}, store.ErrNotFound
 }
-func (g *grantSpyStore) GrantFIFO(_ context.Context, sessionID, buyerID, entID string, _ time.Duration, _ time.Time) (store.QueueEntry, store.Entitlement, error) {
+func (g *grantSpyStore) grantImpl(_ context.Context, sessionID, buyerID, entID string, _ time.Duration, _ time.Time) (store.QueueEntry, store.Entitlement, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.callCount++
@@ -54,6 +55,18 @@ func (g *grantSpyStore) GrantFIFO(_ context.Context, sessionID, buyerID, entID s
 		ent = store.Entitlement{ID: entID, SessionID: sessionID, BuyerID: buyerID, Status: "ISSUED"}
 	}
 	return e, ent, nil
+}
+func (g *grantSpyStore) GrantFIFO(ctx context.Context, sessionID, buyerID, entID string, d time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error) {
+	g.mu.Lock()
+	g.lastPath = "A"
+	g.mu.Unlock()
+	return g.grantImpl(ctx, sessionID, buyerID, entID, d, now)
+}
+func (g *grantSpyStore) GrantFIFOProtocolB(ctx context.Context, sessionID, buyerID, entID string, d time.Duration, now time.Time) (store.QueueEntry, store.Entitlement, error) {
+	g.mu.Lock()
+	g.lastPath = "B"
+	g.mu.Unlock()
+	return g.grantImpl(ctx, sessionID, buyerID, entID, d, now)
 }
 func (g *grantSpyStore) GetEntitlement(context.Context, string) (store.Entitlement, error) {
 	return store.Entitlement{}, store.ErrNotFound

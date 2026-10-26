@@ -30,8 +30,13 @@ var (
 	// Admission
 	admissionGrants = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "gateflow_admission_grants_total",
-		Help: "Admission grant attempts by outcome (ok|fenced|budget|not_found|error)",
-	}, []string{"outcome"})
+		Help: "Admission grant attempts by outcome and protocol (A|B)",
+	}, []string{"outcome", "protocol"})
+
+	admissionGrantProtocol = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gateflow_admission_grant_protocol",
+		Help: "1 for the effective grant protocol selected at process start (label protocol=A|B)",
+	}, []string{"protocol"})
 
 	admissionFenced = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "gateflow_admission_coordination_fenced",
@@ -42,6 +47,13 @@ var (
 		Name: "gateflow_admission_coordination_epoch",
 		Help: "Current admission coordination epoch",
 	})
+
+	// Grant critical-path phase latency (P6.1). phase is bounded enum only.
+	admissionGrantPhase = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gateflow_admission_grant_phase_seconds",
+		Help:    "Admission GrantFIFO phase duration (coord|queue|budget|write|commit|total)",
+		Buckets: []float64{0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+	}, []string{"phase"})
 
 	// Order / recon
 	orderReconBacklog = promauto.NewGauge(prometheus.GaugeOpts{
@@ -184,7 +196,30 @@ func looksLikeID(s string) bool {
 
 // --- setters used by services ---
 
-func AdmissionGrant(outcome string) { admissionGrants.WithLabelValues(outcome).Inc() }
+// AdmissionGrant increments grant outcome counter. protocol must be "A" or "B".
+func AdmissionGrant(outcome, protocol string) {
+	if protocol != "A" && protocol != "B" {
+		protocol = "A"
+	}
+	admissionGrants.WithLabelValues(outcome, protocol).Inc()
+}
+
+// SetAdmissionGrantProtocol marks which protocol this process uses (startup).
+func SetAdmissionGrantProtocol(protocol string) {
+	if protocol != "A" && protocol != "B" {
+		protocol = "A"
+	}
+	admissionGrantProtocol.Reset()
+	admissionGrantProtocol.WithLabelValues(protocol).Set(1)
+}
+
+// AdmissionGrantPhase records GrantFIFO sub-phase latency. phase must be a fixed token.
+func AdmissionGrantPhase(phase string, seconds float64) {
+	if seconds < 0 {
+		return
+	}
+	admissionGrantPhase.WithLabelValues(phase).Observe(seconds)
+}
 
 func SetAdmissionFenced(fenced bool, epoch float64) {
 	if fenced {

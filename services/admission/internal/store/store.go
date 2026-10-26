@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,8 +16,12 @@ var (
 	ErrExpired              = errors.New("expired")
 	ErrInvalidState         = errors.New("invalid state")
 	ErrBudgetExhausted      = errors.New("budget exhausted")
-	ErrCoordinationFenced   = errors.New("coordination fenced")
+	ErrCoordinationFenced      = errors.New("coordination fenced")
 	ErrCoordinationUnavailable = errors.New("coordination state unavailable")
+	// ErrStaleGeneration: experimental Protocol B — grant started under an older
+	// coordination epoch than the authoritative row at late validation (e.g. a
+	// fence advanced epoch even if mode is ACTIVE again after unfence).
+	ErrStaleGeneration = errors.New("stale coordination generation")
 )
 
 const (
@@ -122,76 +127,116 @@ func (s *Store) GetBudget(ctx context.Context, scopeKey string) (Budget, error) 
 	return b, err
 }
 
+// consumeGrantTokens atomically increments global then session grant counters.
+// P6.1: per-scope atomic UPDATE. P6.7: one round-trip CTE for both scopes while
+// coordination lock is held. Semantics unchanged: fail closed if either bump fails.
 func consumeGrantTokens(ctx context.Context, tx pgx.Tx, sessionID string) error {
-	// Lock global then session (consistent order avoids deadlocks).
+	sess := sessionScope(sessionID)
+	// Ensure session row exists outside the conditional bumps (idempotent).
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO budget_scopes (scope_key, max_grants, max_active_checkouts)
+		VALUES ($1, 10000, 1000)
+		ON CONFLICT DO NOTHING`, sess); err != nil {
+		return err
+	}
+	var gOK, sOK int
+	err := tx.QueryRow(ctx, `
+		WITH g AS (
+			UPDATE budget_scopes
+			SET grants_issued = grants_issued + 1, updated_at = now()
+			WHERE scope_key = 'global' AND grants_issued < max_grants
+			RETURNING 1
+		),
+		s AS (
+			UPDATE budget_scopes
+			SET grants_issued = grants_issued + 1, updated_at = now()
+			WHERE scope_key = $1 AND grants_issued < max_grants
+			RETURNING 1
+		)
+		SELECT (SELECT count(*)::int FROM g), (SELECT count(*)::int FROM s)`, sess).
+		Scan(&gOK, &sOK)
+	if err != nil {
+		return err
+	}
+	if gOK != 1 || sOK != 1 {
+		return ErrBudgetExhausted
+	}
+	return nil
+}
+
+func bumpGrantToken(ctx context.Context, tx pgx.Tx, key string) error {
+	// Kept for bind/active paths and tests that may call single-scope bumps.
+	var issued int
+	err := tx.QueryRow(ctx, `
+		UPDATE budget_scopes
+		SET grants_issued = grants_issued + 1, updated_at = now()
+		WHERE scope_key = $1 AND grants_issued < max_grants
+		RETURNING grants_issued`, key).Scan(&issued)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if key == "global" {
+		return ErrBudgetExhausted
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO budget_scopes (scope_key, max_grants, max_active_checkouts)
+		VALUES ($1, 10000, 1000)
+		ON CONFLICT DO NOTHING`, key); err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `
+		UPDATE budget_scopes
+		SET grants_issued = grants_issued + 1, updated_at = now()
+		WHERE scope_key = $1 AND grants_issued < max_grants
+		RETURNING grants_issued`, key).Scan(&issued)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrBudgetExhausted
+	}
+	return err
+}
+
+func consumeActiveCheckout(ctx context.Context, tx pgx.Tx, sessionID string) error {
 	for _, key := range []string{"global", sessionScope(sessionID)} {
-		var maxG, issued int
-		err := tx.QueryRow(ctx, `
-			SELECT max_grants, grants_issued FROM budget_scopes WHERE scope_key=$1 FOR UPDATE`, key).
-			Scan(&maxG, &issued)
-		if errors.Is(err, pgx.ErrNoRows) {
-			if key == "global" {
-				return ErrBudgetExhausted
-			}
-			// Auto-create session budget under lock path
-			_, err = tx.Exec(ctx, `
-				INSERT INTO budget_scopes (scope_key, max_grants, max_active_checkouts)
-				VALUES ($1, 10000, 1000)
-				ON CONFLICT DO NOTHING`, key)
-			if err != nil {
-				return err
-			}
-			err = tx.QueryRow(ctx, `
-				SELECT max_grants, grants_issued FROM budget_scopes WHERE scope_key=$1 FOR UPDATE`, key).
-				Scan(&maxG, &issued)
-		}
-		if err != nil {
-			return err
-		}
-		if issued+1 > maxG {
-			return ErrBudgetExhausted
-		}
-		_, err = tx.Exec(ctx, `
-			UPDATE budget_scopes SET grants_issued = grants_issued + 1, updated_at=now()
-			WHERE scope_key=$1`, key)
-		if err != nil {
+		if err := bumpActiveCheckout(ctx, tx, key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func consumeActiveCheckout(ctx context.Context, tx pgx.Tx, sessionID string) error {
-	for _, key := range []string{"global", sessionScope(sessionID)} {
-		var maxA, active int
-		err := tx.QueryRow(ctx, `
-			SELECT max_active_checkouts, active_checkouts FROM budget_scopes WHERE scope_key=$1 FOR UPDATE`, key).
-			Scan(&maxA, &active)
-		if errors.Is(err, pgx.ErrNoRows) {
-			_, err = tx.Exec(ctx, `
-				INSERT INTO budget_scopes (scope_key, max_grants, max_active_checkouts)
-				VALUES ($1, 10000, 1000) ON CONFLICT DO NOTHING`, key)
-			if err != nil {
-				return err
-			}
-			err = tx.QueryRow(ctx, `
-				SELECT max_active_checkouts, active_checkouts FROM budget_scopes WHERE scope_key=$1 FOR UPDATE`, key).
-				Scan(&maxA, &active)
-		}
-		if err != nil {
-			return err
-		}
-		if active+1 > maxA {
-			return ErrBudgetExhausted
-		}
-		_, err = tx.Exec(ctx, `
-			UPDATE budget_scopes SET active_checkouts = active_checkouts + 1, updated_at=now()
-			WHERE scope_key=$1`, key)
-		if err != nil {
-			return err
-		}
+func bumpActiveCheckout(ctx context.Context, tx pgx.Tx, key string) error {
+	var active int
+	err := tx.QueryRow(ctx, `
+		UPDATE budget_scopes
+		SET active_checkouts = active_checkouts + 1, updated_at = now()
+		WHERE scope_key = $1 AND active_checkouts < max_active_checkouts
+		RETURNING active_checkouts`, key).Scan(&active)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if key == "global" {
+		return ErrBudgetExhausted
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO budget_scopes (scope_key, max_grants, max_active_checkouts)
+		VALUES ($1, 10000, 1000) ON CONFLICT DO NOTHING`, key); err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `
+		UPDATE budget_scopes
+		SET active_checkouts = active_checkouts + 1, updated_at = now()
+		WHERE scope_key = $1 AND active_checkouts < max_active_checkouts
+		RETURNING active_checkouts`, key).Scan(&active)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrBudgetExhausted
+	}
+	return err
 }
 
 func releaseActiveCheckout(ctx context.Context, tx pgx.Tx, sessionID string) error {
@@ -210,7 +255,11 @@ func releaseActiveCheckout(ctx context.Context, tx pgx.Tx, sessionID string) err
 // GrantFIFO issues entitlement for JOINED entry under durable grant budgets.
 // Coordination row is locked FOR UPDATE for the whole transaction so a concurrent
 // fence cannot report success while this grant can still commit under ACTIVE.
+//
+// Lock order (stable): coordination → queue_entry → budget global → budget session.
+// Phase timings are recorded for P6.1 diagnosis (does not change semantics).
 func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID string, unboundTTL time.Duration, now time.Time) (QueueEntry, Entitlement, error) {
+	t0 := time.Now()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return QueueEntry{}, Entitlement{}, err
@@ -218,22 +267,28 @@ func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID
 	defer tx.Rollback(ctx)
 
 	// Linearization lock with operator fence (first durable lock in grant path).
+	tCoord := time.Now()
 	coord, err := lockCoordination(ctx, tx)
+	metrics.AdmissionGrantPhase("coord", time.Since(tCoord).Seconds())
 	if err != nil {
 		return QueueEntry{}, Entitlement{}, err
 	}
+	maybeGrantHook("a_after_coord")
 
+	tQueue := time.Now()
 	var e QueueEntry
 	err = tx.QueryRow(ctx, `
 		SELECT id, session_id, buyer_id, sequence_no, status, entitlement_id, created_at
 		FROM queue_entries WHERE session_id=$1 AND buyer_id=$2 FOR UPDATE`, sessionID, buyerID).
 		Scan(&e.ID, &e.SessionID, &e.BuyerID, &e.SequenceNo, &e.Status, &e.EntitlementID, &e.CreatedAt)
+	metrics.AdmissionGrantPhase("queue", time.Since(tQueue).Seconds())
 	if errors.Is(err, pgx.ErrNoRows) {
 		return e, Entitlement{}, ErrNotFound
 	}
 	if err != nil {
 		return e, Entitlement{}, err
 	}
+	maybeGrantHook("a_after_queue")
 
 	// Existing entitlement: not a new grant — allowed while FENCED.
 	if e.EntitlementID != nil && *e.EntitlementID != "" {
@@ -241,9 +296,12 @@ func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID
 		if err != nil {
 			return e, Entitlement{}, err
 		}
+		tCommit := time.Now()
 		if err := tx.Commit(ctx); err != nil {
 			return e, ent, err
 		}
+		metrics.AdmissionGrantPhase("commit", time.Since(tCommit).Seconds())
+		metrics.AdmissionGrantPhase("total", time.Since(t0).Seconds())
 		return e, ent, nil
 	}
 
@@ -252,29 +310,47 @@ func (s *Store) GrantFIFO(ctx context.Context, sessionID, buyerID, entitlementID
 		return e, Entitlement{}, ErrCoordinationFenced
 	}
 
+	tBudget := time.Now()
 	if err := consumeGrantTokens(ctx, tx, sessionID); err != nil {
+		metrics.AdmissionGrantPhase("budget", time.Since(tBudget).Seconds())
 		return e, Entitlement{}, err
 	}
+	budgetDur := time.Since(tBudget)
+	maybeGrantHook("a_after_budget")
 
+	tWrite := time.Now()
 	ent := Entitlement{
 		ID: entitlementID, SessionID: sessionID, BuyerID: buyerID, QueueEntryID: e.ID,
 		Status: "ISSUED", UnboundExpiresAt: now.Add(unboundTTL), CreatedAt: now, UpdatedAt: now,
 	}
+	// P6.7: single round-trip insert entitlement + grant queue row (same txn/locks).
 	_, err = tx.Exec(ctx, `
-		INSERT INTO entitlements (id, session_id, buyer_id, queue_entry_id, status, unbound_expires_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		WITH ins AS (
+			INSERT INTO entitlements (id, session_id, buyer_id, queue_entry_id, status, unbound_expires_at, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			RETURNING id
+		)
+		UPDATE queue_entries q
+		SET status = 'GRANTED', entitlement_id = (SELECT id FROM ins)
+		WHERE q.id = $4`,
 		ent.ID, ent.SessionID, ent.BuyerID, ent.QueueEntryID, ent.Status, ent.UnboundExpiresAt, ent.CreatedAt, ent.UpdatedAt)
+	writeDur := time.Since(tWrite)
 	if err != nil {
 		return e, ent, err
 	}
-	_, err = tx.Exec(ctx, `
-		UPDATE queue_entries SET status='GRANTED', entitlement_id=$2 WHERE id=$1`, e.ID, ent.ID)
-	if err != nil {
-		return e, ent, err
-	}
+	maybeGrantHook("a_before_commit")
+
+	tCommit := time.Now()
 	if err := tx.Commit(ctx); err != nil {
 		return e, ent, err
 	}
+	commitDur := time.Since(tCommit)
+	// Record phase metrics after commit so Observe does not extend lock hold
+	// (timers still measured under lock). Fence/lock semantics unchanged.
+	metrics.AdmissionGrantPhase("budget", budgetDur.Seconds())
+	metrics.AdmissionGrantPhase("write", writeDur.Seconds())
+	metrics.AdmissionGrantPhase("commit", commitDur.Seconds())
+	metrics.AdmissionGrantPhase("total", time.Since(t0).Seconds())
 	e.Status = "GRANTED"
 	e.EntitlementID = &ent.ID
 	return e, ent, nil

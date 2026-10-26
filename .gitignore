@@ -40,3 +40,6 @@ kafka-data/
 # Test artifacts
 test-results/
 playwright-report/
+
+# Documentation (kept local; not versioned)
+docs/
