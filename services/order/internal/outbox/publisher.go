@@ -7,8 +7,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/httpx"
 	"github.com/ghrushneshrathod/gateflow/libs/go/kafkax"
 	"github.com/ghrushneshrathod/gateflow/libs/go/metrics"
+	"github.com/ghrushneshrathod/gateflow/libs/go/telemetry"
 	"github.com/ghrushneshrathod/gateflow/libs/go/testhooks"
 	"github.com/ghrushneshrathod/gateflow/services/order/internal/store"
 )
@@ -127,16 +129,26 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 		metrics.OutboxPublish("fail")
 		return err
 	}
-	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = p.Producer.Publish(pubCtx, p.Topic, row.AggregateID, map[string]string{
-		"event_id":   row.EventID,
-		"event_type": row.EventType,
-	}, body)
+	headers := map[string]string{
+		"event_id":        row.EventID,
+		"event_type":      row.EventType,
+		"correlation_id":  row.CorrelationID,
+	}
+	carrier := telemetry.CarrierToMap(row.TraceCarrier)
+	// Bind correlation for structured logs around publish.
+	pubBase := ctx
+	if row.CorrelationID != "" {
+		pubBase = httpx.WithCorrelation(ctx, row.CorrelationID)
+	}
+	pubCtx, cancel := context.WithTimeout(pubBase, 5*time.Second)
+	err = p.Producer.PublishWithTrace(pubCtx, p.Topic, row.AggregateID, headers, body, carrier)
 	cancel()
+	log := httpx.Logger(pubBase, p.Log)
 	if err != nil {
 		_ = p.Store.FailOutboxClaim(ctx, row.ID, err.Error())
 		p.Metrics.PublishFail.Add(1)
 		metrics.OutboxPublish("fail")
+		log.Debug("outbox publish failed", "event_id", row.EventID, "err", err)
 		return err
 	}
 	// P4.5: Kafka accepted write; PG published_at not yet set.
@@ -145,11 +157,12 @@ func (p *Publisher) publishRow(ctx context.Context, row store.OutboxRow) error {
 		// Kafka already has the message; stable event_id + consumer dedupe handles republish.
 		p.Metrics.PublishFail.Add(1)
 		metrics.OutboxPublish("fail")
-		p.Log.Error("mark published failed after kafka ack", "event_id", row.EventID, "err", err)
+		log.Error("mark published failed after kafka ack", "event_id", row.EventID, "err", err)
 		return err
 	}
 	p.Metrics.PublishOK.Add(1)
 	metrics.OutboxPublish("ok")
+	log.Info("outbox published", "event_id", row.EventID, "event_type", row.EventType)
 	return nil
 }
 

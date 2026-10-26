@@ -23,6 +23,11 @@ exporters:
   # Metrics scrape endpoint for Prometheus
   prometheus:
     endpoint: "0.0.0.0:8889"
+  # Optional OTLP logs → Loki (host apps primarily use Promtail on GATEFLOW_LOG_DIR)
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    tls:
+      insecure: true
 
 service:
   pipelines:
@@ -34,9 +39,8 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [prometheus, debug]
-    # App logs remain JSON on stdout; Loki via Docker log driver or P5.4.1 filelog.
-    # Keep logs pipeline ready for future OTLP log export.
+    # OTLP log path for future app exporters; primary local path is Promtail → Loki.
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [loki, debug]

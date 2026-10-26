@@ -1,0 +1,33 @@
+# Promtail → Loki for local Gateflow host process logs (P5.4.2).
+# Apps write JSON lines to GATEFLOW_LOG_DIR when set; mount that dir here.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: gateflow-host-logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: gateflow
+          environment: local
+          __path__: /var/log/gateflow/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            service: service
+            level: level
+            msg: msg
+            correlation_id: correlation_id
+            trace_id: trace_id
+            span_id: span_id
+      - labels:
+          service:
+          level:
+      # correlation_id / trace_id stay as log fields (not stream labels) for cardinality safety

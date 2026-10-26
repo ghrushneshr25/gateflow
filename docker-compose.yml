@@ -106,6 +106,19 @@ services:
     ports:
       - "3100:3100"
 
+  # Ships host app JSON logs (GATEFLOW_LOG_DIR) into Loki — not a second scrape of metrics.
+  promtail:
+    profiles: ["obs"]
+    image: grafana/promtail:3.2.1
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./deployments/docker/promtail/config.yml:/etc/promtail/config.yml:ro
+      - ${GATEFLOW_LOG_DIR:-/tmp/gateflow-logs}:/var/log/gateflow:ro
+    depends_on:
+      - loki
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   tempo:
     profiles: ["obs"]
     image: grafana/tempo:2.6.1

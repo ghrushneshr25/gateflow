@@ -86,6 +86,43 @@ curl -sf 'http://localhost:9090/api/v1/targets' | grep -c '"health":"up"'
 
 Apps continue booking. Spans may drop; correctness unchanged.
 
+## Kafka async traces (P5.4.2)
+
+Policy:
+
+1. At order confirm, W3C carrier is stored on `outbox.trace_carrier` (nullable).
+2. Outbox publisher starts a **producer** span under that carrier (same trace as checkout when present) and injects `traceparent` into Kafka headers.
+3. Consumer starts a **new root** span with a **span link** to the producer/checkout context (async side-effect, not a false HTTP child).
+4. Missing/malformed headers never block consumption.
+
+Investigate a booking:
+
+```bash
+# After VS1 with GATEFLOW_OTEL_ENABLED=1
+# Tempo: search service=order root name POST /v1/checkouts
+# Open trace → expect messaging.publish child
+# Linked consumer trace root name messaging.process (separate trace id, 1 link)
+
+# Loki (requires GATEFLOW_LOG_DIR=/tmp/gateflow-logs on apps + promtail)
+curl -sG 'http://localhost:3100/loki/api/v1/query_range' \
+  --data-urlencode 'query={job="gateflow"} |= "<CORRELATION_ULID>"' \
+  --data-urlencode 'limit=50'
+```
+
+Log fields (not stream labels): `correlation_id`, `trace_id`, `span_id`.
+
+## Host log shipping
+
+```bash
+export GATEFLOW_LOG_DIR=/tmp/gateflow-logs
+mkdir -p "$GATEFLOW_LOG_DIR"
+# start apps… then
+docker compose --profile obs up -d promtail loki grafana
+# query Loki as above
+```
+
+Promtail down or Loki down: apps keep writing stdout/files; booking unaffected.
+
 ## Stop
 
 ```bash

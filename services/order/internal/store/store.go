@@ -7,9 +7,21 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ghrushneshrathod/gateflow/libs/go/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func captureTraceCarrier(ctx context.Context) string {
+	return telemetry.CaptureCarrier(ctx)
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
 
 var (
 	ErrNotFound    = errors.New("not found")
@@ -215,10 +227,13 @@ func (s *Store) Confirm(ctx context.Context, orderID, eventID, corr string, payl
 		return o, err
 	}
 	raw, _ := json.Marshal(payload)
+	// Capture W3C carrier from checkout span for async outbox publish (P5.4.2).
+	// Empty when OTel off or no active span; publisher still works.
+	carrier := captureTraceCarrier(ctx)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox (event_id, event_type, schema_version, aggregate_id, payload, correlation_id, created_at)
-		VALUES ($1,'order.order.confirmed',1,$2,$3,$4,$5)
-		ON CONFLICT (event_id) DO NOTHING`, eventID, orderID, raw, corr, now)
+		INSERT INTO outbox (event_id, event_type, schema_version, aggregate_id, payload, correlation_id, created_at, trace_carrier)
+		VALUES ($1,'order.order.confirmed',1,$2,$3,$4,$5,$6)
+		ON CONFLICT (event_id) DO NOTHING`, eventID, orderID, raw, corr, now, nullIfEmpty(carrier))
 	if err != nil {
 		return o, err
 	}
@@ -302,6 +317,7 @@ type OutboxRow struct {
 	AggregateID   string
 	Payload       []byte
 	CorrelationID string
+	TraceCarrier  string // optional W3C header map JSON from checkout (P5.4.2)
 	CreatedAt     time.Time
 	AttemptCount  int
 }
@@ -359,9 +375,10 @@ func (s *Store) ClaimOutbox(ctx context.Context, workerID string, lease time.Dur
 			UPDATE outbox
 			SET locked_by=$2, locked_until=$3, attempt_count = attempt_count + 1, last_error = NULL
 			WHERE id=$1
-			RETURNING id, event_id, event_type, schema_version, aggregate_id, payload, correlation_id, created_at, attempt_count`,
+			RETURNING id, event_id, event_type, schema_version, aggregate_id, payload, correlation_id,
+			          COALESCE(trace_carrier,''), created_at, attempt_count`,
 			id, workerID, until,
-		).Scan(&r.ID, &r.EventID, &r.EventType, &r.SchemaVersion, &r.AggregateID, &r.Payload, &r.CorrelationID, &r.CreatedAt, &r.AttemptCount)
+		).Scan(&r.ID, &r.EventID, &r.EventType, &r.SchemaVersion, &r.AggregateID, &r.Payload, &r.CorrelationID, &r.TraceCarrier, &r.CreatedAt, &r.AttemptCount)
 		if err != nil {
 			return nil, err
 		}
