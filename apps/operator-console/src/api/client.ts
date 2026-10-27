@@ -96,7 +96,32 @@ async function request<T>(
   return (body ?? {}) as T;
 }
 
+export type OperatorLoginResponse = {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  user: { id: string; username: string; display_name?: string; scopes: string[] };
+};
+
 export const api = {
+  login: (username: string, password: string) =>
+    request<OperatorLoginResponse>(SALE, "/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+      token: "",
+    }),
+  createUser: (body: { username: string; password: string; display_name?: string; scopes?: string[] }, token?: string) =>
+    request<{ id: string; username: string }>(SALE, "/v1/admin/users", {
+      method: "POST",
+      body: JSON.stringify(body),
+      token,
+    }),
+  listUsers: (token?: string) =>
+    request<{ items: Array<{ id: string; username: string; display_name?: string; active: boolean }> }>(
+      SALE,
+      "/v1/admin/users",
+      { token },
+    ),
   getReconciliation: (token?: string) =>
     request<ReconciliationList>(ORDER, "/v1/admin/reconciliation", { token }),
   reconcileOrder: (orderId: string, token?: string) =>

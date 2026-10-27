@@ -58,7 +58,7 @@ export function explainApiError(err: unknown): { title: string; action: string; 
   if (err.status === 401) {
     return {
       title: "Not signed in",
-      action: "Paste a valid buyer JWT, then continue.",
+      action: "Sign in with your buyer name above, then continue.",
       retryable: false,
     };
   }

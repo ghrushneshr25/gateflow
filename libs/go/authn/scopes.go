@@ -6,6 +6,8 @@ const (
 
 	ScopeSaleWrite   = "ops:sale:write"
 	ScopeSalePublish = "ops:sale:publish"
+	// ScopeUsersAdmin allows creating/listing operator users (sale auth API).
+	ScopeUsersAdmin = "ops:users:write"
 
 	ScopeInventoryWrite = "inventory:write"
 

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gateflow-obs
+description: Optional observability stack for Gateflow local kind (separate namespace)
+type: application
+version: 0.1.0
+appVersion: "p8-local"

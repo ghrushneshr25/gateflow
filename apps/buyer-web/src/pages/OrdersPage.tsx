@@ -33,7 +33,7 @@ export function OrdersPage() {
       <div>
         <h2>Orders</h2>
         <p className="muted" role="status">
-          Sign in with a buyer JWT to list <em>your</em> orders only.
+          Sign in to list <em>your</em> orders only.
         </p>
       </div>
     );

@@ -37,7 +37,7 @@ export function OrderDetailPage() {
   if (!signedIn) {
     return (
       <p className="muted" role="status">
-        Buyer JWT required to view order detail.
+        Sign in to view order detail.
       </p>
     );
   }

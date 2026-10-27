@@ -1,14 +1,14 @@
 # Generic multi-stage build for Gateflow Go services.
-# Usage: docker build -f deployments/docker/Dockerfile.service --build-arg SERVICE=sale -t gateflow-sale .
-
+# Usage: docker build -f deployments/docker/Dockerfile.service --build-arg SERVICE=sale -t gateflow/sale:p8-local .
 ARG SERVICE=sale
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 ARG SERVICE
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
 COPY go.work go.work.sum ./
 COPY libs/go ./libs/go
 COPY services ./services
+COPY tools ./tools
 WORKDIR /src/services/${SERVICE}
 RUN CGO_ENABLED=0 go build -o /out/service ./cmd/server
 

@@ -1,0 +1,116 @@
+# Default values — safe local lab defaults (not production secrets).
+nameOverride: ""
+fullnameOverride: gateflow
+
+imagePullPolicy: IfNotPresent
+imageTag: p8-local
+
+# Explicit Protocol A
+admission:
+  grantProtocol: "A"
+
+jwt:
+  # Lab only — override via --set-file or Secret in real envs
+  secret: "gateflow-dev-secret-change-me"
+
+# Buyer Google OAuth Web client ID (public). Empty = Google sign-in disabled.
+google:
+  clientId: ""
+
+admin:
+  # Bootstrap operator (sale service). Change in real deploys.
+  username: admin
+  password: "GateflowAdmin1!"
+
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  user: gateflow
+  password: gateflow
+  database: gateflow
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+kafka:
+  enabled: true
+  image: apache/kafka:3.8.1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+
+redis:
+  enabled: false
+  image: redis:7-alpine
+
+migrate:
+  image: gateflow/migrate
+  backoffLimit: 2
+
+apps:
+  sale:
+    enabled: true
+    image: gateflow/sale
+    replicas: 1
+    port: 8080
+  admission:
+    enabled: true
+    image: gateflow/admission
+    replicas: 1
+    port: 8080
+  inventory:
+    enabled: true
+    image: gateflow/inventory
+    replicas: 1
+    port: 8080
+  order:
+    enabled: true
+    image: gateflow/order
+    replicas: 1
+    port: 8080
+  paymentSimulator:
+    enabled: true
+    image: gateflow/payment-simulator
+    replicas: 1
+    port: 8080
+  buyerWeb:
+    enabled: true
+    image: gateflow/buyer-web
+    replicas: 1
+    port: 80
+  operatorConsole:
+    enabled: true
+    image: gateflow/operator-console
+    replicas: 1
+    port: 80
+
+resources:
+  backend:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  frontend:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+observability:
+  enabled: false

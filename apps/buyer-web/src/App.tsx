@@ -32,7 +32,7 @@ export function App() {
               <div>
                 <h2>Welcome</h2>
                 <p className="muted">
-                  Paste a buyer JWT, open a published offering, join the queue, request a grant, then
+                  Sign up with Gmail or email, browse offerings, join the queue, get a grant, then
                   checkout. Confirmed only when the order API returns CONFIRMED.
                 </p>
                 <p>

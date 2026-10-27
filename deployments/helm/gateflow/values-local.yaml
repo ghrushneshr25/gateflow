@@ -1,0 +1,17 @@
+# Local kind demo overrides
+imagePullPolicy: Never
+imageTag: p8-local
+
+admission:
+  grantProtocol: "A"
+
+postgres:
+  persistence:
+    enabled: true
+    size: 2Gi
+
+redis:
+  enabled: false
+
+observability:
+  enabled: false

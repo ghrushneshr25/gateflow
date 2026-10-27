@@ -16,6 +16,8 @@ import (
 	"github.com/ghrushneshrathod/gateflow/libs/go/logging"
 	"github.com/ghrushneshrathod/gateflow/libs/go/telemetry"
 	"github.com/ghrushneshrathod/gateflow/services/sale/internal/app"
+	"github.com/ghrushneshrathod/gateflow/services/sale/internal/httpserver"
+	"github.com/ghrushneshrathod/gateflow/services/sale/internal/store"
 )
 
 func main() {
@@ -28,6 +30,7 @@ func main() {
 	}
 
 	var readyErr error
+	var poolClose func()
 	dbURL := firstNonEmpty(os.Getenv("SALE_DATABASE_URL"), cfg.DatabaseURL)
 	if dbURL == "" {
 		readyErr = errNoDB
@@ -37,14 +40,23 @@ func main() {
 			readyErr = err
 			log.Error("wire", "err", err)
 		} else {
-			defer pool.Close()
+			poolClose = pool.Close
+			st := store.New(pool)
+			if created, user, berr := httpserver.BootstrapDefaultAdmin(context.Background(), st); berr != nil {
+				log.Warn("admin bootstrap", "err", berr)
+			} else if created {
+				log.Info("default admin user created", "username", user, "hint", "GATEFLOW_ADMIN_PASSWORD")
+			}
 		}
+	}
+	if poolClose != nil {
+		defer poolClose()
 	}
 
 	mux := http.NewServeMux()
 	httpx.MountHealth(mux, cfg.Name, func() error { return readyErr })
 	mux.HandleFunc("GET /v1/meta", func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"service": cfg.Name, "phase": 3, "di": "nexus"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"service": cfg.Name, "phase": 3, "di": "nexus", "auth": "operator_users"})
 	})
 	if readyErr == nil {
 		nexus.MustGet(app.APIServerContract).Routes(mux)

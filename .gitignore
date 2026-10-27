@@ -43,3 +43,9 @@ playwright-report/
 
 # Documentation (kept local; not versioned)
 docs/
+
+# Local demo runtime
+.demo-logs/
+
+# Local tooling binaries
+.tools/

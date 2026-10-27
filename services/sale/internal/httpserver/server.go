@@ -58,6 +58,8 @@ type Server struct {
 	Store            SaleStore
 	InventoryBaseURL string
 	HTTP             HTTPDoer
+	// googleValidate optional; nil uses Google idtoken.Validate.
+	googleValidate googleIDTokenValidator
 }
 
 func New(st *store.Store) *Server {
@@ -79,6 +81,8 @@ func NewWithDeps(st SaleStore, httpDoer HTTPDoer, inventoryBase string) *Server 
 }
 
 func (s *Server) Routes(mux *http.ServeMux) {
+	s.mountAuthRoutes(mux)
+	s.mountBuyerAuthRoutes(mux)
 	mux.HandleFunc("POST /v1/offerings", s.createOffering)
 	mux.HandleFunc("GET /v1/offerings", s.listOfferings)
 	mux.HandleFunc("GET /v1/offerings/{id}", s.getOffering)

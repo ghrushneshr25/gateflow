@@ -137,7 +137,7 @@ export function BookingPage() {
       setBanner({
         tone: "error",
         title: "Not signed in",
-        action: "Paste a buyer JWT, then checkout.",
+        action: "Sign in with your buyer name, then checkout.",
       });
       return;
     }
@@ -304,7 +304,7 @@ export function BookingPage() {
 
       {!signedIn && (
         <p className="warn" role="status">
-          Sign in with a buyer JWT above before queue, grant, or checkout.
+          Sign in above before queue, grant, or checkout.
         </p>
       )}
 

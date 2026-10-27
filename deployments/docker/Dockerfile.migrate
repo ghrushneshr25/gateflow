@@ -1,0 +1,12 @@
+# Runs Gateflow SQL migrations against Postgres (K8s Job / local).
+FROM postgres:16-alpine
+WORKDIR /migrate
+COPY deployments/docker/postgres/init.sql /migrate/init.sql
+COPY services/sale/migrations /migrate/sale
+COPY services/admission/migrations /migrate/admission
+COPY services/inventory/migrations /migrate/inventory
+COPY services/order/migrations /migrate/order
+COPY services/payment-simulator/migrations /migrate/payment
+COPY deployments/docker/migrate-entrypoint.sh /migrate/entrypoint.sh
+RUN chmod +x /migrate/entrypoint.sh
+ENTRYPOINT ["/migrate/entrypoint.sh"]

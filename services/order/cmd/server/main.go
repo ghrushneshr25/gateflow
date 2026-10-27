@@ -176,8 +176,10 @@ func main() {
 	handler := httpx.WrapHandler(cfg.Name, authn.Middleware(mux))
 	srv := httpx.NewServer(cfg.HTTPAddr, handler)
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr)
+		// Log after bind attempt outcome is visible via ListenAndServe error path.
+		log.Info("http server starting", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("http server failed", "addr", cfg.HTTPAddr, "err", err)
 			os.Exit(1)
 		}
 	}()

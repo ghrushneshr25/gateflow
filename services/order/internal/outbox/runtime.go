@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,7 +45,11 @@ func (r *Runtime) Run(ctx context.Context) {
 		r.Metrics = &Metrics{}
 	}
 	if r.Topic == "" {
-		r.Topic = kafkax.TopicOrderConfirmed
+		if t := strings.TrimSpace(os.Getenv("GATEFLOW_KAFKA_TOPIC")); t != "" {
+			r.Topic = t
+		} else {
+			r.Topic = kafkax.TopicOrderConfirmed
+		}
 	}
 	if r.Group == "" {
 		if g := os.Getenv("GATEFLOW_KAFKA_GROUP"); g != "" {

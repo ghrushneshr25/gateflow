@@ -58,6 +58,11 @@ export function clearBuyerSession(): void {
   }
   for (const k of drop) sessionStorage.removeItem(k);
   clearToken();
+  try {
+    sessionStorage.removeItem("gateflow_buyer_profile");
+  } catch {
+    /* ignore */
+  }
 }
 
 function idemStorageKey(sessionId: string, ticketTypeId: string): string {
@@ -155,7 +160,32 @@ async function request<T>(base: string, path: string, init?: RequestInit & { tok
   return (body ?? {}) as T;
 }
 
+export type BuyerAuthProviders = {
+  providers: Array<{ id: string; enabled: boolean; client_id?: string; label?: string }>;
+  local_password: boolean;
+};
+
+export type BuyerGoogleAuthResponse = {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  buyer: {
+    buyer_id: string;
+    email: string;
+    display_name?: string;
+    picture_url?: string;
+    provider: string;
+  };
+};
+
 export const api = {
+  buyerProviders: () => request<BuyerAuthProviders>(SALE, "/v1/auth/buyer/providers"),
+  buyerGoogle: (idToken: string) =>
+    request<BuyerGoogleAuthResponse>(SALE, "/v1/auth/buyer/google", {
+      method: "POST",
+      body: JSON.stringify({ id_token: idToken }),
+      token: "", // no buyer token yet
+    }),
   listOfferings: () =>
     request<{ items: Offering[] }>(SALE, "/v1/offerings?status=PUBLISHED"),
   getOffering: (id: string) => request<Offering>(SALE, `/v1/offerings/${encodeURIComponent(id)}`),

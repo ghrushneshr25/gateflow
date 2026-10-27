@@ -125,8 +125,12 @@ type result struct {
 	Setup       map[string]string `json:"setup,omitempty"`
 	Ops         []opStats         `json:"ops"`
 	Invariants  map[string]any    `json:"invariants"`
-	Notes       []string          `json:"notes"`
-	OK          bool              `json:"ok"`
+	// CheckoutOutcomes: mutually exclusive classification (P7.1). sum_classes == attempts.
+	CheckoutOutcomes map[string]int64 `json:"checkout_outcomes,omitempty"`
+	// Unexpected5xxSLO: provisional gate; false when unclassified remain.
+	Unexpected5xxSLO map[string]any `json:"unexpected_5xx_slo,omitempty"`
+	Notes            []string       `json:"notes"`
+	OK               bool           `json:"ok"`
 }
 
 func main() {
@@ -342,6 +346,27 @@ func scenarioC(client *http.Client, cfg config, ses, tt, pool, svc string, res *
 			op.Name = fmt.Sprintf("c%d_%s", cc, op.Name)
 			res.Ops = append(res.Ops, op)
 		}
+		// Merge checkout outcome counters across spike steps.
+		if sub.CheckoutOutcomes != nil {
+			if res.CheckoutOutcomes == nil {
+				res.CheckoutOutcomes = map[string]int64{}
+			}
+			for k, v := range sub.CheckoutOutcomes {
+				if k == "sum_classes" {
+					continue
+				}
+				res.CheckoutOutcomes[k] += v
+			}
+			var sum int64
+			for _, name := range classOrder {
+				sum += res.CheckoutOutcomes[name]
+			}
+			res.CheckoutOutcomes["sum_classes"] = sum
+			pass, rate, reason := unexpected5xxSLO(res.CheckoutOutcomes, 0.01)
+			res.Unexpected5xxSLO = map[string]any{
+				"pass": pass, "rate": rate, "threshold": 0.01, "reason": reason,
+			}
+		}
 		res.Notes = append(res.Notes, fmt.Sprintf("spike step concurrency=%d journeys=%d", cc, len(sub.Ops)))
 	}
 	return nil
@@ -499,10 +524,11 @@ func runConcurrentJourneys(client *http.Client, cfg config, ses, tt, pool, svc s
 	hCheckout := &latencyHist{}
 	var eBrowse, eJoin, eGrant, eCheckout atomic.Int64
 	var okCheckout, failCheckout, otherCheckout atomic.Int64
+	var outcomes outcomeCounters
 
 	if doWarmup && cfg.Warmup > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.Warmup)
-		runWorkers(ctx, client, cfg, ses, tt, pool, svc, conc, hBrowse, hJoin, hGrant, hCheckout, &eBrowse, &eJoin, &eGrant, &eCheckout, &okCheckout, &failCheckout, &otherCheckout)
+		runWorkers(ctx, client, cfg, ses, tt, pool, svc, conc, hBrowse, hJoin, hGrant, hCheckout, &eBrowse, &eJoin, &eGrant, &eCheckout, &okCheckout, &failCheckout, &otherCheckout, &outcomes)
 		cancel()
 		// reset histograms after warmup
 		*hBrowse, *hJoin, *hGrant, *hCheckout = latencyHist{}, latencyHist{}, latencyHist{}, latencyHist{}
@@ -513,11 +539,12 @@ func runConcurrentJourneys(client *http.Client, cfg config, ses, tt, pool, svc s
 		okCheckout.Store(0)
 		failCheckout.Store(0)
 		otherCheckout.Store(0)
+		outcomes = outcomeCounters{}
 	}
 
 	wall0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), dur)
-	runWorkers(ctx, client, cfg, ses, tt, pool, svc, conc, hBrowse, hJoin, hGrant, hCheckout, &eBrowse, &eJoin, &eGrant, &eCheckout, &okCheckout, &failCheckout, &otherCheckout)
+	runWorkers(ctx, client, cfg, ses, tt, pool, svc, conc, hBrowse, hJoin, hGrant, hCheckout, &eBrowse, &eJoin, &eGrant, &eCheckout, &okCheckout, &failCheckout, &otherCheckout, &outcomes)
 	cancel()
 	wall := time.Since(wall0)
 
@@ -531,12 +558,22 @@ func runConcurrentJourneys(client *http.Client, cfg config, ses, tt, pool, svc s
 	res.Invariants["checkouts_confirmed"] = okCheckout.Load()
 	res.Invariants["checkouts_failed_status"] = failCheckout.Load()
 	res.Invariants["checkouts_other_status"] = otherCheckout.Load()
+	snap := outcomes.snapshot()
+	res.CheckoutOutcomes = snap
+	pass, rate, reason := unexpected5xxSLO(snap, 0.01)
+	res.Unexpected5xxSLO = map[string]any{
+		"pass": pass, "rate": rate, "threshold": 0.01, "reason": reason,
+	}
+	if !pass {
+		res.Notes = append(res.Notes, "unexpected_5xx_slo: "+reason)
+	}
 	return nil
 }
 
 func runWorkers(ctx context.Context, client *http.Client, cfg config, ses, tt, pool, svc string,
 	conc int, hBrowse, hJoin, hGrant, hCheckout *latencyHist,
-	eBrowse, eJoin, eGrant, eCheckout, okCheckout, failCheckout, otherCheckout *atomic.Int64) {
+	eBrowse, eJoin, eGrant, eCheckout, okCheckout, failCheckout, otherCheckout *atomic.Int64,
+	outcomes *outcomeCounters) {
 	var wg sync.WaitGroup
 	for i := 0; i < conc; i++ {
 		wg.Add(1)
@@ -554,6 +591,9 @@ func runWorkers(ctx context.Context, client *http.Client, cfg config, ses, tt, p
 				btok, err := authn.MintBuyerJWT(cfg.Secret, buyer, nil, time.Hour)
 				if err != nil {
 					eCheckout.Add(1)
+					if outcomes != nil {
+						outcomes.add(ClassUnclassified)
+					}
 					continue
 				}
 				// browse
@@ -605,18 +645,20 @@ func runWorkers(ctx context.Context, client *http.Client, cfg config, ses, tt, p
 					"idempotency_key": idem,
 				})
 				hCheckout.add(time.Since(t0))
-				if err != nil || code >= 400 {
+				class := classifyCheckout(code, body, err)
+				if outcomes != nil {
+					outcomes.add(class)
+				}
+				if legacyHTTPErr(class) {
 					eCheckout.Add(1)
 					continue
 				}
-				st := digString(body, "status")
-				switch st {
-				case "CONFIRMED":
+				switch class {
+				case ClassBizConfirmed:
 					okCheckout.Add(1)
-				case "FAILED":
+				case ClassBizFailedStatus:
 					failCheckout.Add(1)
 				default:
-					// PAYMENT_PENDING, RECONCILIATION_REQUIRED, CREATED, etc.
 					otherCheckout.Add(1)
 				}
 			}
@@ -838,6 +880,22 @@ func printSummary(res *result) {
 			op.Name, op.Count, op.Errors, op.P50Ms, op.P95Ms, op.P99Ms, op.RPS)
 	}
 	fmt.Printf("  invariants: %v\n", res.Invariants)
+	if len(res.CheckoutOutcomes) > 0 {
+		fmt.Printf("  checkout_outcomes: attempts=%d sum=%d confirmed=%d failed_status=%d http_5xx=%d timeout=%d transport=%d unclassified=%d\n",
+			res.CheckoutOutcomes["attempts"],
+			res.CheckoutOutcomes["sum_classes"],
+			res.CheckoutOutcomes[ClassBizConfirmed],
+			res.CheckoutOutcomes[ClassBizFailedStatus],
+			res.CheckoutOutcomes[ClassHTTP5xx],
+			res.CheckoutOutcomes[ClassClientTimeout],
+			res.CheckoutOutcomes[ClassTransportError],
+			res.CheckoutOutcomes[ClassUnclassified],
+		)
+	}
+	if res.Unexpected5xxSLO != nil {
+		fmt.Printf("  unexpected_5xx_slo: pass=%v rate=%v reason=%v\n",
+			res.Unexpected5xxSLO["pass"], res.Unexpected5xxSLO["rate"], res.Unexpected5xxSLO["reason"])
+	}
 	for _, n := range res.Notes {
 		fmt.Printf("  note: %s\n", n)
 	}

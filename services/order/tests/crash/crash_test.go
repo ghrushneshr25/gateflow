@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -96,7 +97,12 @@ func envOr(k, d string) string {
 }
 
 func withHTTPAddr(env []string, addr string) []string {
+	// Bind IPv4 loopback explicitly so waitPort healthz dials match Listen.
 	return append(env, "HTTP_ADDR="+addr)
+}
+
+func loopback(port int) string {
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 type stack struct {
@@ -110,29 +116,11 @@ func startStack(t *testing.T, orderExtra []string) *stack {
 	hookDir := t.TempDir()
 	logDir := t.TempDir()
 	env := baseEnv(hookDir)
+	// Per-suite Kafka topic isolation (shared local broker still OK; no FirstOffset drain of foreign traffic).
+	topic := "gateflow.order.order.confirmed.crash." + ids.New("t")
+	env = append(env, "GATEFLOW_KAFKA_TOPIC="+topic)
 	s := &stack{hookDir: hookDir, t: t}
-	var err error
-	s.inv, err = startProc("inventory", "inventory", 8083, withHTTPAddr(env, ":8083"), filepath.Join(logDir, "inv.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.sale, err = startProc("sale", "sale", 8081, withHTTPAddr(env, ":8081"), filepath.Join(logDir, "sale.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.adm, err = startProc("admission", "admission", 8082, withHTTPAddr(env, ":8082"), filepath.Join(logDir, "adm.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.pay, err = startProc("payment", "payment-simulator", 8085, withHTTPAddr(env, ":8085"), filepath.Join(logDir, "pay.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	oenv := append(withHTTPAddr(env, ":8084"), orderExtra...)
-	s.order, err = startProc("order", "order", 8084, oenv, filepath.Join(logDir, "ord.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Register cleanup immediately so partial start failures do not leak listeners.
 	t.Cleanup(func() {
 		_ = s.order.Kill()
 		_ = s.pay.Kill()
@@ -140,6 +128,40 @@ func startStack(t *testing.T, orderExtra []string) *stack {
 		_ = s.sale.Kill()
 		_ = s.inv.Kill()
 	})
+	var err error
+	s.inv, err = startProc("inventory", "inventory", 8083, withHTTPAddr(env, loopback(8083)), filepath.Join(logDir, "inv.log"))
+	if err != nil {
+		t.Fatalf("INFRA: %v", err)
+	}
+	s.sale, err = startProc("sale", "sale", 8081, withHTTPAddr(env, loopback(8081)), filepath.Join(logDir, "sale.log"))
+	if err != nil {
+		t.Fatalf("INFRA: %v", err)
+	}
+	s.adm, err = startProc("admission", "admission", 8082, withHTTPAddr(env, loopback(8082)), filepath.Join(logDir, "adm.log"))
+	if err != nil {
+		t.Fatalf("INFRA: %v", err)
+	}
+	s.pay, err = startProc("payment", "payment-simulator", 8085, withHTTPAddr(env, loopback(8085)), filepath.Join(logDir, "pay.log"))
+	if err != nil {
+		t.Fatalf("INFRA: %v", err)
+	}
+	oenv := append(withHTTPAddr(env, loopback(8084)), orderExtra...)
+	// Ensure topic env survives orderExtra overrides unless caller sets GATEFLOW_KAFKA_TOPIC.
+	hasTopic := false
+	for _, e := range oenv {
+		if len(e) >= len("GATEFLOW_KAFKA_TOPIC=") && e[:len("GATEFLOW_KAFKA_TOPIC=")] == "GATEFLOW_KAFKA_TOPIC=" {
+			hasTopic = true
+			break
+		}
+	}
+	if !hasTopic {
+		oenv = append(oenv, "GATEFLOW_KAFKA_TOPIC="+topic)
+	}
+	s.order, err = startProc("order", "order", 8084, oenv, filepath.Join(logDir, "ord.log"))
+	if err != nil {
+		t.Fatalf("INFRA: %v", err)
+	}
+	t.Logf("crash stack kafka topic=%s", topic)
 	return s
 }
 

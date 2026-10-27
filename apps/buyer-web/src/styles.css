@@ -75,6 +75,18 @@ button.secondary {
 .steps { display: flex; flex-wrap: wrap; gap: 1rem; list-style: none; padding: 0; color: var(--muted); }
 .steps .active { color: var(--accent); font-weight: 600; }
 code { font-size: .8rem; word-break: break-all; }
+.advanced { margin-top: .75rem; }
+.advanced summary { cursor: pointer; user-select: none; }
+.auth-bar label { display: block; font-weight: 600; margin-bottom: .25rem; }
+.auth-title { margin: 0 0 .35rem; font-size: 1.15rem; }
+.google-wrap { margin: .75rem 0; }
+.google-btn { min-height: 40px; }
+.info-box {
+  background: rgba(91,140,255,.08);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: .65rem .75rem;
+}
 .break { word-break: break-all; }
 .banner {
   border: 1px solid var(--border);

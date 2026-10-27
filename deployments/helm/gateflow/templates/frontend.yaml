@@ -1,0 +1,66 @@
+{{- $root := . -}}
+{{- $ns := include "gateflow.fullname" . -}}
+{{- range $key, $app := dict
+  "buyer-web" .Values.apps.buyerWeb
+  "operator-console" .Values.apps.operatorConsole
+}}
+{{- if $app.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $ns }}-{{ $key }}
+  labels:
+    {{- include "gateflow.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $key }}
+spec:
+  ports:
+    - port: {{ $app.port }}
+      targetPort: http
+      name: http
+  selector:
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: {{ $key }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $ns }}-{{ $key }}
+  labels:
+    {{- include "gateflow.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $key }}
+spec:
+  replicas: {{ $app.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+      app.kubernetes.io/component: {{ $key }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ $root.Release.Name }}
+        app.kubernetes.io/component: {{ $key }}
+    spec:
+      containers:
+        - name: {{ $key }}
+          image: "{{ $app.image }}:{{ $root.Values.imageTag }}"
+          imagePullPolicy: {{ $root.Values.imagePullPolicy }}
+          ports:
+            - containerPort: {{ $app.port }}
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $root.Values.resources.frontend | nindent 12 }}
+{{- end }}
+{{- end }}

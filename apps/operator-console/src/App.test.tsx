@@ -13,7 +13,7 @@ describe("App", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Gateflow Ops");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Gateflow Admin");
     const nav = screen.getByRole("navigation", { name: "Primary" });
     expect(nav).toBeInTheDocument();
     expect(nav).toHaveTextContent("Sales");
